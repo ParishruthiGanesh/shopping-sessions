@@ -34,7 +34,6 @@ use time::DAY;
 const PARTITION_BITS: u32 = 8;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
 const BLOCK_BITS: u32 = 12;
-const BLOCK: usize = 1 << BLOCK_BITS;
 const CHUNK: usize = 1 << 18;
 const INVALID: u32 = u32::MAX;
 const SESSION_GAP: u32 = 30 * 60 * 1000;
@@ -340,8 +339,8 @@ fn partition(key: Key) -> usize {
 /// late: it still takes part in the dedup, and if it is the kept copy the event is dropped.
 #[repr(C)]
 struct Event {
-    id: [u64; 2],
-    user: [u64; 2],
+    id: Key,
+    user: Key,
     ingest: u32, // seconds
     ts: u32,     // milliseconds since `base`
     price: u32,  // 0 unless a purchase
@@ -351,29 +350,20 @@ struct Event {
 /// A surviving event, by person.
 #[repr(C)]
 struct Visit {
-    person: [u64; 2],
+    person: Key,
     ts: u32,
     price: u32,
     category: u32,
 }
 
-/// A valid click, by person. Padded to 48 bytes so that whole rows fill a staging buffer.
+/// A valid click, by person.
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
+#[repr(C)]
 struct Click {
-    person: [u64; 2],
-    id: [u64; 2],
+    person: Key,
+    id: Key,
     ts: u32,
     campaign: u32,
-}
-
-#[inline(always)]
-fn split(key: Key) -> [u64; 2] {
-    [(key >> 64) as u64, key as u64]
-}
-#[inline(always)]
-fn join(parts: [u64; 2]) -> Key {
-    (u128::from(parts[0]) << 64) | u128::from(parts[1])
 }
 
 struct Context {
@@ -442,7 +432,7 @@ fn number_ids(sides: &[Vec<Vec<Side>>], shards: &[Mutex<Shard>], next: &AtomicUs
         for thread in sides {
             numbers.push(Vec::with_capacity(thread[shard_at].len()));
             for &(key, _) in &thread[shard_at] {
-                let next = keys.len() as u128;
+                let next = keys.len() as Key;
                 let local = ids.insert(key, next);
                 if local == next {
                     keys.push(key);
@@ -521,8 +511,8 @@ fn parse_events(context: &Context, index: &mut scan::Index, data: &[u8], start: 
         let user = key::key(data, fields[1].0, fields[1].1);
         let ingest = time::parse(field(3), &mut dates);
         let mut event = Event {
-            id: split(id),
-            user: split(user),
+            id,
+            user,
             ingest: ingest.map_or(INVALID, |ms| ms.div_euclid(1000).clamp(0, i64::from(INVALID - 1)) as u32),
             ts: INVALID,
             price: 0,
@@ -566,7 +556,7 @@ fn parse_events(context: &Context, index: &mut scan::Index, data: &[u8], start: 
 
 fn parse_clicks(context: &Context, links: &Links, index: &mut scan::Index, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
     let mut dates = time::Dates::new();
-    let mut pending: [(Key, Click); CLICK_AHEAD] = std::array::from_fn(|_| (0, Click { person: [0; 2], id: [0; 2], ts: 0, campaign: 0 }));
+    let mut pending: [(Key, Click); CLICK_AHEAD] = std::array::from_fn(|_| (0, Click { person: 0, id: 0, ts: 0, campaign: 0 }));
     let mut taken = 0usize;
     scan::scan::<4>(index, data, start, end, |fields| {
         // Copies of a click are identical and nothing counts clicks, so no dedup is needed:
@@ -588,7 +578,7 @@ fn parse_clicks(context: &Context, links: &Links, index: &mut scan::Index, data:
         if taken >= CLICK_AHEAD {
             send(links, slot, out);
         }
-        *slot = (user, Click { person: [0; 2], id: split(id), ts: (ts - context.base) as u32, campaign });
+        *slot = (user, Click { person: 0, id, ts: (ts - context.base) as u32, campaign });
         taken += 1;
     });
     for slot in &mut pending[..taken.min(CLICK_AHEAD)] {
@@ -602,7 +592,7 @@ const CLICK_AHEAD: usize = 16;
 #[inline(always)]
 fn send(links: &Links, (user, click): &mut (Key, Click), out: &mut [Part<Click>]) {
     let person = links.person(*user);
-    click.person = split(person);
+    click.person = person;
     out[partition(person)].push(*click);
 }
 
@@ -633,13 +623,13 @@ fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut
                 // The table is larger than the L2 cache: ask for the slot of a later event now.
                 // SAFETY: the row is inside the block, and prefetching never faults.
                 let ahead = unsafe { (*bases[block_at].add(at + DEDUP_AHEAD)).id };
-                prefetch(table.as_ptr().wrapping_add(key::hash(join(ahead)) as usize & mask));
+                prefetch(table.as_ptr().wrapping_add(key::hash(ahead) as usize & mask));
             }
             // SAFETY: `at` is inside the block; nothing else holds a reference to this event.
             let event = unsafe { &mut *bases[block_at].add(at) };
-            let hash = key::hash(join(event.id));
+            let hash = key::hash(event.id);
             let tag = hash & 0xFFFF_FFFF_0000_0000;
-            let entry = tag | ((block_at << BLOCK_BITS | at) as u64 + 1);
+            let entry = tag | ((block_at * Block::<Event>::CAPACITY + at) as u64 + 1);
             let mut slot = hash as usize & mask;
             loop {
                 let seen = table[slot];
@@ -650,7 +640,8 @@ fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut
                 if seen & 0xFFFF_FFFF_0000_0000 == tag {
                     let index = (seen as u32 - 1) as usize;
                     // SAFETY: the index was stored from a valid block and offset, and is not this event.
-                    let other = unsafe { &mut *bases[index >> BLOCK_BITS].add(index & (BLOCK - 1)) };
+                    let (other_block, other_at) = (index / Block::<Event>::CAPACITY, index % Block::<Event>::CAPACITY);
+                    let other = unsafe { &mut *bases[other_block].add(other_at) };
                     if other.id == event.id {
                         // Two copies: the earlier ingest is kept, valid or not.
                         if event.ingest < other.ingest {
@@ -669,12 +660,12 @@ fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut
     for block in blocks.iter().map(Block::rows) {
         for (at, event) in block.iter().enumerate() {
             if let Some(ahead) = block.get(at + 8) {
-                links.prefetch(join(ahead.user));
+                links.prefetch(ahead.user);
             }
             if event.ts != INVALID {
-                let user = join(event.user);
+                let user = event.user;
                 let person = links.person(user);
-                out[partition(person)].push(Visit { person: split(person), ts: event.ts, price: event.price, category: event.category });
+                out[partition(person)].push(Visit { person, ts: event.ts, price: event.price, category: event.category });
             }
         }
     }
@@ -845,7 +836,7 @@ impl<'a> Worker<'a> {
         self.visit_person.clear();
         self.visit_start.clear();
         for visit in visit_blocks.iter().flat_map(Block::rows) {
-            let person = join(visit.person);
+            let person = visit.person;
             let mut slot = key::hash(person) as usize & mask;
             let index = loop {
                 let seen = self.table[slot];
@@ -889,7 +880,7 @@ impl<'a> Worker<'a> {
         self.click_start.clear();
         self.click_start.resize(people + 1, 0);
         for click in click_blocks.iter().flat_map(Block::rows) {
-            let person = join(click.person);
+            let person = click.person;
             let mut slot = key::hash(person) as usize & mask;
             let index = loop {
                 let seen = self.table[slot];
@@ -915,7 +906,7 @@ impl<'a> Worker<'a> {
         for (click, &person) in click_blocks.iter().flat_map(Block::rows).zip(&self.click_person) {
             if person != u32::MAX {
                 let at = &mut self.click_start[person as usize];
-                self.clicks[*at as usize] = PersonClick { id: join(click.id), ts: click.ts, campaign: click.campaign };
+                self.clicks[*at as usize] = PersonClick { id: click.id, ts: click.ts, campaign: click.campaign };
                 *at += 1;
             }
         }
