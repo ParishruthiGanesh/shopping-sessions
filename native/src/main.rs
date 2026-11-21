@@ -103,6 +103,9 @@ fn fail(message: &str) -> ! {
 }
 
 /// Every `*.csv` in a folder, mapped, with its chunks: `(file, start, end)`.
+/// Only the header is read here; the bounds are nominal, and `chunk` moves each
+/// to the start of a line when a thread takes it. Finding every line end here
+/// took 16 ms at 20M events: one page fault per chunk, one after another.
 fn map_folder(folder: &Path, files: &mut Vec<Mapped>) -> Vec<(usize, usize, usize)> {
     let mut paths: Vec<PathBuf> = match fs::read_dir(folder) {
         Ok(entries) => entries
@@ -115,14 +118,38 @@ fn map_folder(folder: &Path, files: &mut Vec<Mapped>) -> Vec<(usize, usize, usiz
     let mut tasks = Vec::new();
     for path in paths {
         if let Some(mapped) = Mapped::open(&path) {
-            let at = files.len();
-            tasks.extend(scan::chunks(mapped.bytes(), CHUNK).into_iter().map(|(start, end)| (at, start, end)));
+            let data = mapped.bytes();
+            // After the header line; a file that is only a header (or not even that) has no lines.
+            if let Some(header) = data.iter().position(|&byte| byte == b'\n') {
+                let at = files.len();
+                let mut start = header + 1;
+                while start < data.len() {
+                    let end = start.saturating_add(CHUNK).min(data.len());
+                    tasks.push((at, start, end));
+                    start = end;
+                }
+            }
             files.push(mapped);
         }
     }
     // Largest chunks first, so the threads finish together.
     tasks.sort_by_key(|&(_, start, end)| std::cmp::Reverse(end - start));
     tasks
+}
+
+/// The lines of a task from `map_folder`: each bound moves to the start of the
+/// first line at or after it, so a line belongs to the chunk it starts in.
+/// The first chunk of a file starts right after the header, on a line start already.
+fn chunk<'a>(files: &'a [Mapped], &(file, start, end): &(usize, usize, usize)) -> (&'a [u8], usize, usize) {
+    let data = files[file].bytes();
+    let line_start = |at: usize| {
+        if at >= data.len() || data[at - 1] == b'\n' {
+            return at.min(data.len());
+        }
+        data[at..].iter().position(|&byte| byte == b'\n').map_or(data.len(), |offset| at + offset + 1)
+    };
+    let (start, end) = (line_start(start), line_start(end));
+    (data, start, end.max(start))
 }
 
 /// A two-column lookup file: `(key, second column)` per line.
@@ -917,6 +944,11 @@ struct Worker<'a> {
     window: Vec<u32>,
     window_count: Vec<u32>,
     window_at: Vec<u32>,
+    /// For each campaign in the window, the number of the first session it assists.
+    window_since: Vec<u32>,
+    /// The current person's sessions so far, and `(day, first session)` of each day they fall on.
+    session: u32,
+    day_runs: Vec<(u32, u32)>,
     category_revenue: Vec<u64>,
     touched: Vec<u32>,
     // The row group being built.
@@ -952,6 +984,9 @@ impl<'a> Worker<'a> {
             window: Vec::new(),
             window_count: vec![0; context.campaign_rows.len()],
             window_at: vec![0; context.campaign_rows.len()],
+            window_since: vec![0; context.campaign_rows.len()],
+            session: 0,
+            day_runs: Vec::new(),
             category_revenue: vec![0; context.categories.len()],
             touched: Vec::new(),
             rows: 0,
@@ -1176,6 +1211,9 @@ impl<'a> Worker<'a> {
             // A session: from `at` until a gap of over 30 minutes.
             let start = (visits[at] >> 32) as u32;
             let day = ((u64::from(start) + context.day_shift) / DAY as u64) as u32 - 7;
+            if self.day_runs.last().is_none_or(|&(run_day, _)| run_day != day) {
+                self.day_runs.push((day, self.session));
+            }
             if day != row_day {
                 if row_day != u32::MAX {
                     self.row(person, row_day, row_sessions, row_events, row_revenue);
@@ -1226,10 +1264,9 @@ impl<'a> Worker<'a> {
             total.sessions += 1;
             total.purchasing += u64::from(purchased);
             total.revenue += revenue;
-            // Every campaign with a click in the window assists the session once.
-            for &assisting in &self.window {
-                self.campaign_days[assisting as usize * days + day as usize].assisted += 1;
-            }
+            // Every campaign with a click in the window assists the session once:
+            // counted when the campaign leaves the window, for all its sessions at once.
+            self.session += 1;
             row_sessions += 1;
             row_events += (at - first) as u32;
             row_revenue += revenue;
@@ -1237,11 +1274,34 @@ impl<'a> Worker<'a> {
         if row_day != u32::MAX {
             self.row(person, row_day, row_sessions, row_events, row_revenue);
         }
-        for &campaign in &self.window {
+        for at in 0..self.window.len() {
+            let campaign = self.window[at];
             self.window_count[campaign as usize] = 0;
+            self.assist(campaign, self.window_since[campaign as usize], self.session);
         }
         self.window.clear();
+        self.day_runs.clear();
+        self.session = 0;
         self.click_keys = keys;
+    }
+
+    /// `campaign` assisted this person's sessions `from..to` (numbered in time
+    /// order): add them up per day. Days only grow with the session number.
+    #[inline(always)]
+    fn assist(&mut self, campaign: u32, from: u32, to: u32) {
+        if from >= to {
+            return;
+        }
+        let days = self.context.days;
+        let mut run = self.day_runs.partition_point(|&(_, first)| first <= from) - 1;
+        let mut at = from;
+        while at < to {
+            let (day, _) = self.day_runs[run];
+            let end = self.day_runs.get(run + 1).map_or(to, |&(_, first)| first.min(to));
+            self.campaign_days[campaign as usize * days + day as usize].assisted += u64::from(end - at);
+            at = end;
+            run += 1;
+        }
     }
 
     /// One more of the window's clicks is of `campaign`.
@@ -1250,6 +1310,7 @@ impl<'a> Worker<'a> {
         let count = &mut self.window_count[campaign as usize];
         if *count == 0 {
             self.window_at[campaign as usize] = self.window.len() as u32;
+            self.window_since[campaign as usize] = self.session;
             self.window.push(campaign);
         }
         *count += 1;
@@ -1261,6 +1322,7 @@ impl<'a> Worker<'a> {
         let count = &mut self.window_count[campaign as usize];
         *count -= 1;
         if *count == 0 {
+            self.assist(campaign, self.window_since[campaign as usize], self.session);
             let at = self.window_at[campaign as usize] as usize;
             let last = self.window.pop().unwrap();
             if last != campaign {
@@ -1353,8 +1415,8 @@ fn main() {
                 scope.spawn(move || {
                     let mut sides: Vec<Vec<Side>> = (0..SHARDS).map(|_| Vec::new()).collect();
                     let mut count = 0u32;
-                    while let Some(&(file, start, end)) = link_tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let data = files[file].bytes();
+                    while let Some(task) = link_tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let (data, start, end) = chunk(files, task);
                         scan::lines::<2>(data, start, end, |fields| {
                             let a = key::key(data, fields[0].0, fields[0].1);
                             let b = key::key(data, fields[1].0, fields[1].1);
@@ -1396,11 +1458,13 @@ fn main() {
                 let (event_tasks, click_tasks, next_event, next_click) = (&event_tasks, &click_tasks, &next_event, &next_click);
                 scope.spawn(move || {
                     let (mut events, mut clicks) = (EventParts::new(), Parts::new());
-                    while let Some(&(file, start, end)) = event_tasks.get(next_event.fetch_add(1, Ordering::Relaxed)) {
-                        parse_events(context, links, files[file].bytes(), start, end, &mut events);
+                    while let Some(task) = event_tasks.get(next_event.fetch_add(1, Ordering::Relaxed)) {
+                        let (data, start, end) = chunk(files, task);
+                        parse_events(context, links, data, start, end, &mut events);
                     }
-                    while let Some(&(file, start, end)) = click_tasks.get(next_click.fetch_add(1, Ordering::Relaxed)) {
-                        parse_clicks(context, links, files[file].bytes(), start, end, &mut clicks);
+                    while let Some(task) = click_tasks.get(next_click.fetch_add(1, Ordering::Relaxed)) {
+                        let (data, start, end) = chunk(files, task);
+                        parse_clicks(context, links, data, start, end, &mut clicks);
                     }
                     events.seal();
                     clicks.seal();
