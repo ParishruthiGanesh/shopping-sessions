@@ -585,6 +585,15 @@ fn parse_clicks(context: &Context, links: &Links, index: &mut scan::Index, data:
 
 // ------------------------------------------------------------------ 3. dedup
 
+/// How many events ahead the dedup prefetches its table slot.
+const DEDUP_AHEAD: usize = 16;
+
+#[inline(always)]
+fn prefetch<T>(pointer: *const T) {
+    // SAFETY: prefetching never faults, whatever the address.
+    unsafe { std::arch::x86_64::_mm_prefetch(pointer.cast(), std::arch::x86_64::_MM_HINT_T0) };
+}
+
 fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut [Part<Visit>]) {
     let total: usize = blocks.iter().map(|block| block.len).sum();
     if total == 0 {
@@ -597,6 +606,12 @@ fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut
     let bases: Vec<*mut Event> = blocks.iter().map(|block| block.rows).collect();
     for (block_at, block) in blocks.iter().enumerate() {
         for at in 0..block.len {
+            if at + DEDUP_AHEAD < block.len {
+                // The table is larger than the L2 cache: ask for the slot of a later event now.
+                // SAFETY: the row is inside the block, and prefetching never faults.
+                let ahead = unsafe { (*bases[block_at].add(at + DEDUP_AHEAD)).id };
+                prefetch(table.as_ptr().wrapping_add(key::hash(join(ahead)) as usize & mask));
+            }
             // SAFETY: `at` is inside the block; nothing else holds a reference to this event.
             let event = unsafe { &mut *bases[block_at].add(at) };
             let hash = key::hash(join(event.id));
@@ -1166,6 +1181,9 @@ fn main() {
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
     let visits = gather(visits);
+    // Largest partitions first (a whale's can take ten times the average), so the threads finish together.
+    let mut order: Vec<usize> = (0..PARTITIONS).collect();
+    order.sort_by_cached_key(|&at| std::cmp::Reverse(visits[at].lock().unwrap().iter().map(|block| block.len).sum::<usize>()));
     log("deduplicated events");
 
     // 4. Sessions, credit and assists per person partition; each thread writes its own user_daily file.
@@ -1178,14 +1196,11 @@ fn main() {
     let totals: Vec<(Vec<CampaignDay>, bool)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (visits, clicks, next, user_dir) = (&visits, &clicks, &next, &user_dir);
+                let (visits, clicks, next, user_dir, order) = (&visits, &clicks, &next, &user_dir, &order);
                 scope.spawn(move || {
                     let mut worker = Worker::new(context, user_dir.join(format!("part-{thread}.parquet")));
                     loop {
-                        let at = next.fetch_add(1, Ordering::Relaxed);
-                        if at >= PARTITIONS {
-                            break;
-                        }
+                        let Some(&at) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
                         let visit_blocks = std::mem::take(&mut *visits[at].lock().unwrap());
                         let click_blocks = std::mem::take(&mut *clicks[at].lock().unwrap());
                         worker.partition(&visit_blocks, &click_blocks);
