@@ -699,8 +699,11 @@ struct Worker<'a> {
     click_person: Vec<u32>,
     click_start: Vec<u32>,
     clicks: Vec<PersonClick>,
-    session_start: Vec<u32>,
-    session_day: Vec<u32>,
+    click_keys: Vec<u64>,
+    /// The campaigns with clicks in the 7 days before the current session, how many each, and where each is in `window`.
+    window: Vec<u32>,
+    window_count: Vec<u32>,
+    window_at: Vec<u32>,
     category_revenue: Vec<u64>,
     touched: Vec<u32>,
     // The row group being built.
@@ -730,8 +733,10 @@ impl<'a> Worker<'a> {
             click_person: Vec::new(),
             click_start: Vec::new(),
             clicks: Vec::new(),
-            session_start: Vec::new(),
-            session_day: Vec::new(),
+            click_keys: Vec::new(),
+            window: Vec::new(),
+            window_count: vec![0; context.campaign_rows.len()],
+            window_at: vec![0; context.campaign_rows.len()],
             category_revenue: vec![0; context.categories.len()],
             touched: Vec::new(),
             rows: 0,
@@ -913,12 +918,16 @@ impl<'a> Worker<'a> {
         let days = context.days;
         let organic = context.campaign_rows.len();
         visits.sort_unstable();
-        // By time; within one instant the smallest click_id first.
-        clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::compare(a.id, b.id)));
-        self.session_start.clear();
-        self.session_day.clear();
+        // The clicks by time, as `ts << 32 | index`; ties in time are settled by click_id below.
+        self.click_keys.clear();
+        self.click_keys.extend(clicks.iter().enumerate().map(|(at, click)| u64::from(click.ts) << 32 | at as u64));
+        self.click_keys.sort_unstable();
+        let keys = std::mem::take(&mut self.click_keys);
+        let click = |key: u64| &clicks[key as u32 as usize];
 
-        let (mut next_click, mut best) = (0usize, usize::MAX);
+        // `keys[low..high]` are the clicks in the 7 days up to the current session's
+        // start: they assist it, and the latest of them is credited with it.
+        let (mut low, mut high, mut best) = (0usize, 0usize, usize::MAX);
         let (mut row_day, mut row_sessions, mut row_events, mut row_revenue) = (u32::MAX, 0u32, 0u32, 0u64);
         let mut at = 0;
         while at < visits.len() {
@@ -952,51 +961,69 @@ impl<'a> Worker<'a> {
                 }
                 at += 1;
             }
-            // Credit: the latest click at or before the start, if within 7 days.
-            while next_click < clicks.len() && clicks[next_click].ts <= start {
-                if best == usize::MAX || clicks[next_click].ts != clicks[best].ts {
-                    best = next_click;
+            // Clicks at or before the start join the window. The credit goes to the
+            // latest; among clicks at the same instant, to the smallest click_id.
+            while high < keys.len() && (keys[high] >> 32) as u32 <= start {
+                let index = keys[high] as u32 as usize;
+                if best == usize::MAX
+                    || clicks[index].ts != clicks[best].ts
+                    || key::compare(clicks[index].id, clicks[best].id).is_lt()
+                {
+                    best = index;
                 }
-                next_click += 1;
+                self.window_add(click(keys[high]).campaign);
+                high += 1;
+            }
+            // Clicks more than 7 days before the start leave it.
+            while low < high && ((keys[low] >> 32) as u32) < start.saturating_sub(WEEK) {
+                self.window_remove(click(keys[low]).campaign);
+                low += 1;
             }
             let campaign = if best != usize::MAX && start - clicks[best].ts <= WEEK { clicks[best].campaign as usize } else { organic };
             let total = &mut self.campaign_days[campaign * days + day as usize];
             total.sessions += 1;
             total.purchasing += u64::from(purchased);
             total.revenue += revenue;
+            // Every campaign with a click in the window assists the session once.
+            for &assisting in &self.window {
+                self.campaign_days[assisting as usize * days + day as usize].assisted += 1;
+            }
             row_sessions += 1;
             row_events += (at - first) as u32;
             row_revenue += revenue;
-            self.session_start.push(start);
-            self.session_day.push(day);
         }
         if row_day != u32::MAX {
             self.row(person, row_day, row_sessions, row_events, row_revenue);
         }
-        if clicks.is_empty() {
-            return;
+        for &campaign in &self.window {
+            self.window_count[campaign as usize] = 0;
         }
-        // Assists: per campaign, merge the 7 days after each click into intervals;
-        // every session starting inside one is assisted once.
-        clicks.sort_unstable_by_key(|click| (click.campaign, click.ts));
-        let (starts, session_days) = (&self.session_start[..], &self.session_day[..]);
-        let mut at = 0;
-        while at < clicks.len() {
-            let campaign = clicks[at].campaign;
-            let from = clicks[at].ts;
-            let mut to = from + WEEK;
-            at += 1;
-            while at < clicks.len() && clicks[at].campaign == campaign && clicks[at].ts <= to {
-                to = clicks[at].ts + WEEK;
-                at += 1;
-            }
-            let mut session = starts.partition_point(|&start| start < from);
-            let end = session + starts[session..].partition_point(|&start| start <= to);
-            while session < end {
-                let day = session_days[session];
-                let same = session_days[session..end].partition_point(|&other| other == day);
-                self.campaign_days[campaign as usize * days + day as usize].assisted += same as u64;
-                session += same;
+        self.window.clear();
+        self.click_keys = keys;
+    }
+
+    /// One more of the window's clicks is of `campaign`.
+    #[inline(always)]
+    fn window_add(&mut self, campaign: u32) {
+        let count = &mut self.window_count[campaign as usize];
+        if *count == 0 {
+            self.window_at[campaign as usize] = self.window.len() as u32;
+            self.window.push(campaign);
+        }
+        *count += 1;
+    }
+
+    /// One fewer of the window's clicks is of `campaign`.
+    #[inline(always)]
+    fn window_remove(&mut self, campaign: u32) {
+        let count = &mut self.window_count[campaign as usize];
+        *count -= 1;
+        if *count == 0 {
+            let at = self.window_at[campaign as usize] as usize;
+            let last = self.window.pop().unwrap();
+            if last != campaign {
+                self.window[at] = last;
+                self.window_at[last as usize] = at as u32;
             }
         }
     }
