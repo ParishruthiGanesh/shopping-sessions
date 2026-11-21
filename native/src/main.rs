@@ -358,6 +358,7 @@ struct Visit {
 }
 
 /// A valid click, by person. Padded to 48 bytes so that whole rows fill a staging buffer.
+#[derive(Clone, Copy)]
 #[repr(C, align(16))]
 struct Click {
     person: [u64; 2],
@@ -565,6 +566,8 @@ fn parse_events(context: &Context, index: &mut scan::Index, data: &[u8], start: 
 
 fn parse_clicks(context: &Context, links: &Links, index: &mut scan::Index, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
     let mut dates = time::Dates::new();
+    let mut pending: [(Key, Click); CLICK_AHEAD] = std::array::from_fn(|_| (0, Click { person: [0; 2], id: [0; 2], ts: 0, campaign: 0 }));
+    let mut taken = 0usize;
     scan::scan::<4>(index, data, start, end, |fields| {
         // Copies of a click are identical and nothing counts clicks, so no dedup is needed:
         // a second copy can never change which campaign is credited or assists.
@@ -578,9 +581,29 @@ fn parse_clicks(context: &Context, links: &Links, index: &mut scan::Index, data:
         if ts < context.base || ts >= context.window_end {
             return;
         }
-        let person = links.person(user);
-        out[partition(person)].push(Click { person: split(person), id: split(id), ts: (ts - context.base) as u32, campaign });
+        // The user's slot in the links is far away in memory: ask for it now and
+        // look the person up CLICK_AHEAD clicks later.
+        links.prefetch(user);
+        let slot = &mut pending[taken % CLICK_AHEAD];
+        if taken >= CLICK_AHEAD {
+            send(links, slot, out);
+        }
+        *slot = (user, Click { person: [0; 2], id: split(id), ts: (ts - context.base) as u32, campaign });
+        taken += 1;
     });
+    for slot in &mut pending[..taken.min(CLICK_AHEAD)] {
+        send(links, slot, out);
+    }
+}
+
+/// Valid clicks waiting for their person to be looked up, as `(user, click)`.
+const CLICK_AHEAD: usize = 16;
+
+#[inline(always)]
+fn send(links: &Links, (user, click): &mut (Key, Click), out: &mut [Part<Click>]) {
+    let person = links.person(*user);
+    click.person = split(person);
+    out[partition(person)].push(*click);
 }
 
 // ------------------------------------------------------------------ 3. dedup
