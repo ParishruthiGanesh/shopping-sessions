@@ -11,10 +11,14 @@
 //!               credit and assist, and write the user_daily rows
 //!   5. campaign_daily from the per-thread totals
 
+mod bump;
 mod key;
 mod parquet;
 mod scan;
 mod time;
+
+#[global_allocator]
+static ALLOCATOR: bump::Bump = bump::Bump;
 
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
@@ -45,6 +49,7 @@ mod libc {
     pub const PROT_READ: c_int = 1;
     pub const MAP_PRIVATE: c_int = 2;
     pub const MADV_WILLNEED: c_int = 3;
+
     pub const MAP_FAILED: *mut c_void = !0 as *mut c_void;
     extern "C" {
         pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
@@ -135,45 +140,111 @@ fn manifest_time(text: &[u8], name: &str) -> i64 {
         let at = find(0, format!("\"{name}\"").as_bytes())? + name.len() + 2;
         let open = find(find(at, b":")?, b"\"")? + 1;
         let close = find(open, b"\"")?;
-        time::parse(&text[open..close])
+        time::parse(&text[open..close], &mut time::Dates::new())
     })();
     parsed.unwrap_or_else(|| fail(&format!("manifest.json: no valid {name}")))
 }
 
 // ------------------------------------------------------------------ records
 
+/// Bytes per block of rows. Every row type uses the same size, so a block
+/// that one stage has finished with can hold another stage's rows.
+const BLOCK_BYTES: usize = 48 << BLOCK_BITS;
+const SLAB_BYTES: usize = 64 * BLOCK_BYTES;
+
+/// A thread's supply of blocks: carved from large slabs, and reused when given back.
+struct Arena {
+    free: Vec<*mut u8>,
+    cursor: *mut u8,
+    left: usize,
+}
+
+thread_local! {
+    static ARENA: std::cell::RefCell<Arena> = const { std::cell::RefCell::new(Arena { free: Vec::new(), cursor: std::ptr::null_mut(), left: 0 }) };
+}
+
+impl Arena {
+    fn take() -> *mut u8 {
+        ARENA.with_borrow_mut(|arena| {
+            if let Some(block) = arena.free.pop() {
+                return block;
+            }
+            if arena.left == 0 {
+                let layout = std::alloc::Layout::from_size_align(SLAB_BYTES, 4096).unwrap();
+                // SAFETY: the layout has a size.
+                let slab = unsafe { std::alloc::alloc(layout) };
+                if slab.is_null() {
+                    fail("out of memory");
+                }
+                (arena.cursor, arena.left) = (slab, SLAB_BYTES / BLOCK_BYTES);
+            }
+            let block = arena.cursor;
+            // SAFETY: the slab has `left` blocks after `cursor`.
+            arena.cursor = unsafe { block.add(BLOCK_BYTES) };
+            arena.left -= 1;
+            block
+        })
+    }
+    fn give(block: *mut u8) {
+        ARENA.with_borrow_mut(|arena| arena.free.push(block));
+    }
+}
+
+/// A block of rows: `len` of them at `rows`.
+struct Block<T> {
+    rows: *mut T,
+    len: usize,
+}
+// SAFETY: a block is owned by whoever holds it, like a Vec.
+unsafe impl<T: Send> Send for Block<T> {}
+
+impl<T> Block<T> {
+    const CAPACITY: usize = BLOCK_BYTES / std::mem::size_of::<T>();
+    fn rows(&self) -> &[T] {
+        // SAFETY: `len` rows were written at `rows`.
+        unsafe { std::slice::from_raw_parts(self.rows, self.len) }
+    }
+    /// Hands the memory back to this thread's arena. The rows need no dropping.
+    fn recycle(self) {
+        Arena::give(self.rows.cast());
+    }
+}
+
 /// Rows headed for one partition, in fixed-size blocks so nothing is ever moved.
 struct Part<T> {
-    blocks: Vec<Vec<T>>,
-    current: Vec<T>,
+    blocks: Vec<Block<T>>,
+    current: *mut T,
+    len: usize,
 }
+// SAFETY: as for Block.
+unsafe impl<T: Send> Send for Part<T> {}
 
 impl<T> Part<T> {
     fn new() -> Self {
-        Self { blocks: Vec::new(), current: Vec::new() }
+        // "Full" until the first push, so that empty partitions cost nothing.
+        Self { blocks: Vec::new(), current: std::ptr::null_mut(), len: Block::<T>::CAPACITY }
     }
     #[cold]
+    #[inline(never)]
     fn grow(&mut self) {
-        let full = std::mem::replace(&mut self.current, Vec::with_capacity(BLOCK));
-        if !full.is_empty() {
-            self.blocks.push(full);
+        if !self.current.is_null() {
+            self.blocks.push(Block { rows: self.current, len: self.len });
         }
+        self.current = Arena::take().cast();
+        self.len = 0;
     }
     #[inline(always)]
     fn push(&mut self, value: T) {
-        if self.current.len() == self.current.capacity() {
+        if self.len == Block::<T>::CAPACITY {
             self.grow();
         }
-        // SAFETY: there is spare capacity.
-        unsafe {
-            let len = self.current.len();
-            self.current.as_mut_ptr().add(len).write(value);
-            self.current.set_len(len + 1);
-        }
+        // SAFETY: the current block has room for row `len`.
+        unsafe { self.current.add(self.len).write(value) };
+        self.len += 1;
     }
-    fn into_blocks(mut self) -> Vec<Vec<T>> {
-        if !self.current.is_empty() {
-            self.blocks.push(self.current);
+    fn into_blocks(mut self) -> Vec<Block<T>> {
+        if !self.current.is_null() {
+            self.blocks.push(Block { rows: self.current, len: self.len });
         }
         self.blocks
     }
@@ -184,8 +255,8 @@ fn parts<T>() -> Vec<Part<T>> {
 }
 
 /// Regroups each thread's partitions into one list of blocks per partition.
-fn gather<T>(threads: Vec<Vec<Part<T>>>) -> Vec<Mutex<Vec<Vec<T>>>> {
-    let mut out: Vec<Vec<Vec<T>>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
+fn gather<T>(threads: Vec<Vec<Part<T>>>) -> Vec<Mutex<Vec<Block<T>>>> {
+    let mut out: Vec<Vec<Block<T>>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
     for thread in threads {
         for (at, part) in thread.into_iter().enumerate() {
             out[at].extend(part.into_blocks());
@@ -255,12 +326,87 @@ struct Context {
 
 // ------------------------------------------------------------------ 1. links
 
-/// The person (their smallest ID) of every ID that a link joins to another.
-fn build_links(pairs: Vec<Vec<(Key, Key)>>) -> KeyMap<Key> {
-    let total: usize = pairs.iter().map(Vec::len).sum();
-    let mut ids: KeyMap<Key> = KeyMap::with_capacity(total + total / 4);
-    let mut parent: Vec<u32> = Vec::with_capacity(total * 2);
-    let mut keys: Vec<Key> = Vec::with_capacity(total * 2);
+const SHARD_BITS: u32 = 8;
+const SHARDS: usize = 1 << SHARD_BITS;
+
+/// The person (their smallest ID) of every ID that a link joins to another,
+/// in shards by the top bits of the ID's hash so the threads can build it together.
+struct Links {
+    shards: Vec<KeyMap<Key>>,
+}
+
+impl Links {
+    #[inline(always)]
+    fn person(&self, user: Key) -> Key {
+        let hash = key::hash(user);
+        self.shards[(hash >> (64 - SHARD_BITS)) as usize].get_hashed(user, hash).unwrap_or(user)
+    }
+    #[inline(always)]
+    fn prefetch(&self, user: Key) {
+        let hash = key::hash(user);
+        self.shards[(hash >> (64 - SHARD_BITS)) as usize].prefetch_hashed(hash);
+    }
+}
+
+/// One shard's IDs, numbered in the order they were first seen.
+#[derive(Default)]
+struct Shard {
+    ids: Option<KeyMap<Key>>,
+    keys: Vec<Key>,
+    numbers: Vec<Vec<u32>>,
+}
+
+/// One side of a link on its way to a shard: the ID, and `link << 1 | side`
+/// with links numbered within the thread that parsed them.
+type Side = (Key, u32);
+
+/// Step 1, by many threads: number the IDs of each shard. `sides[thread][shard]` are the
+/// parsed links; the shard keeps each side's number in the same order, in `numbers[thread]`.
+fn number_ids(sides: &[Vec<Vec<Side>>], shards: &[Mutex<Shard>], next: &AtomicUsize) {
+    loop {
+        let shard_at = next.fetch_add(1, Ordering::Relaxed);
+        if shard_at >= SHARDS {
+            return;
+        }
+        let total: usize = sides.iter().map(|thread| thread[shard_at].len()).sum();
+        let mut ids: KeyMap<Key> = KeyMap::with_capacity(total);
+        let mut keys = Vec::with_capacity(total);
+        let mut numbers = Vec::with_capacity(sides.len());
+        for thread in sides {
+            numbers.push(Vec::with_capacity(thread[shard_at].len()));
+            for &(key, _) in &thread[shard_at] {
+                let next = keys.len() as u128;
+                let local = ids.insert(key, next);
+                if local == next {
+                    keys.push(key);
+                }
+                numbers.last_mut().unwrap().push(local as u32);
+            }
+        }
+        *shards[shard_at].lock().unwrap() = Shard { ids: Some(ids), keys, numbers };
+    }
+}
+
+/// Step 2, by one thread: union-find over the numbers, then name each person.
+fn join_links(sides: &[Vec<Vec<Side>>], counts: &[usize], shards: Vec<Mutex<Shard>>) -> Links {
+    let mut shards: Vec<Shard> = shards.into_iter().map(|shard| shard.into_inner().unwrap()).collect();
+    let mut bases = Vec::with_capacity(SHARDS);
+    let mut keys: Vec<Key> = Vec::new();
+    for shard in &shards {
+        bases.push(keys.len() as u32);
+        keys.extend_from_slice(&shard.keys);
+    }
+    // Each link's two IDs, numbered across all shards.
+    let starts: Vec<usize> = counts.iter().scan(0, |sum, &count| Some(std::mem::replace(sum, *sum + count))).collect();
+    let mut links = vec![[0u32; 2]; counts.iter().sum()];
+    for (shard_at, shard) in shards.iter().enumerate() {
+        for ((thread, numbers), &start) in sides.iter().zip(&shard.numbers).zip(&starts) {
+            for (&(_, side), &local) in thread[shard_at].iter().zip(numbers) {
+                links[start + (side >> 1) as usize][(side & 1) as usize] = bases[shard_at] + local;
+            }
+        }
+    }
+    let mut parent: Vec<u32> = (0..keys.len() as u32).collect();
     fn find(parent: &mut [u32], mut at: u32) -> u32 {
         let mut root = at;
         while parent[root as usize] != root {
@@ -271,20 +417,10 @@ fn build_links(pairs: Vec<Vec<(Key, Key)>>) -> KeyMap<Key> {
         }
         root
     }
-    for &(a, b) in pairs.iter().flatten() {
-        let mut index = |key: Key| {
-            let next = keys.len() as u128;
-            let index = ids.insert(key, next);
-            if index == next {
-                keys.push(key);
-                parent.push(next as u32);
-            }
-            index as u32
-        };
-        let (x, y) = (index(a), index(b));
-        let (x, y) = (find(&mut parent, x), find(&mut parent, y));
-        if x != y {
-            parent[x as usize] = y;
+    for &[a, b] in &links {
+        let (a, b) = (find(&mut parent, a), find(&mut parent, b));
+        if a != b {
+            parent[a as usize] = b;
         }
     }
     let mut name = keys.clone();
@@ -294,24 +430,27 @@ fn build_links(pairs: Vec<Vec<(Key, Key)>>) -> KeyMap<Key> {
             name[root] = keys[at];
         }
     }
-    for slot in ids.slots_mut() {
-        if slot.0 != 0 {
-            slot.1 = name[parent[slot.1 as usize] as usize];
+    for (shard, &base) in shards.iter_mut().zip(&bases) {
+        for slot in shard.ids.as_mut().unwrap().slots_mut() {
+            if slot.0 != 0 {
+                slot.1 = name[parent[base as usize + slot.1 as usize] as usize];
+            }
         }
     }
-    ids
+    Links { shards: shards.into_iter().map(|shard| shard.ids.unwrap()).collect() }
 }
 
 // ------------------------------------------------------------------ 2. parse
 
 fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &mut [Part<Event>]) {
+    let mut dates = time::Dates::new();
     scan::scan::<7>(data, start, end, |fields| {
         let id = key::key(data, fields[0].0, fields[0].1);
         if id == 0 {
             return;
         }
         let user = key::key(data, fields[1].0, fields[1].1);
-        let ingest = time::parse(&data[fields[3].0..fields[3].1]);
+        let ingest = time::parse(&data[fields[3].0..fields[3].1], &mut dates);
         let mut event = Event {
             id: split(id),
             user: split(user),
@@ -324,7 +463,7 @@ fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &
             if user == 0 || fields[5].0 == fields[5].1 {
                 break 'valid;
             }
-            let Some(ts) = time::parse(&data[fields[2].0..fields[2].1]) else { break 'valid };
+            let Some(ts) = time::parse(&data[fields[2].0..fields[2].1], &mut dates) else { break 'valid };
             if ts < context.window_start || ts >= context.window_end {
                 break 'valid;
             }
@@ -351,7 +490,8 @@ fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &
     });
 }
 
-fn parse_clicks(context: &Context, links: &KeyMap<Key>, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
+fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
+    let mut dates = time::Dates::new();
     scan::scan::<4>(data, start, end, |fields| {
         // Copies of a click are identical and nothing counts clicks, so no dedup is needed:
         // a second copy can never change which campaign is credited or assists.
@@ -361,19 +501,19 @@ fn parse_clicks(context: &Context, links: &KeyMap<Key>, data: &[u8], start: usiz
             return;
         }
         let Some(campaign) = context.campaigns.get(key::key(data, fields[2].0, fields[2].1)) else { return };
-        let Some(ts) = time::parse(&data[fields[3].0..fields[3].1]) else { return };
+        let Some(ts) = time::parse(&data[fields[3].0..fields[3].1], &mut dates) else { return };
         if ts < context.base || ts >= context.window_end {
             return;
         }
-        let person = links.get(user).unwrap_or(user);
+        let person = links.person(user);
         out[partition(person)].push(Click { person: split(person), id: split(id), ts: (ts - context.base) as u32, campaign });
     });
 }
 
 // ------------------------------------------------------------------ 3. dedup
 
-fn dedup(blocks: &mut [Vec<Event>], table: &mut Vec<u64>, links: &KeyMap<Key>, out: &mut [Part<Visit>]) {
-    let total: usize = blocks.iter().map(Vec::len).sum();
+fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut [Part<Visit>]) {
+    let total: usize = blocks.iter().map(|block| block.len).sum();
     if total == 0 {
         return;
     }
@@ -381,9 +521,9 @@ fn dedup(blocks: &mut [Vec<Event>], table: &mut Vec<u64>, links: &KeyMap<Key>, o
     table.clear();
     table.resize(size, 0);
     let mask = size - 1;
-    let bases: Vec<*mut Event> = blocks.iter_mut().map(|block| block.as_mut_ptr()).collect();
+    let bases: Vec<*mut Event> = blocks.iter().map(|block| block.rows).collect();
     for (block_at, block) in blocks.iter().enumerate() {
-        for at in 0..block.len() {
+        for at in 0..block.len {
             // SAFETY: `at` is inside the block; nothing else holds a reference to this event.
             let event = unsafe { &mut *bases[block_at].add(at) };
             let hash = key::hash(join(event.id));
@@ -415,14 +555,14 @@ fn dedup(blocks: &mut [Vec<Event>], table: &mut Vec<u64>, links: &KeyMap<Key>, o
             }
         }
     }
-    for block in blocks.iter() {
+    for block in blocks.iter().map(Block::rows) {
         for (at, event) in block.iter().enumerate() {
             if let Some(ahead) = block.get(at + 8) {
                 links.prefetch(join(ahead.user));
             }
             if event.ts != INVALID {
                 let user = join(event.user);
-                let person = links.get(user).unwrap_or(user);
+                let person = links.person(user);
                 out[partition(person)].push(Visit { person: split(person), ts: event.ts, price: event.price, category: event.category });
             }
         }
@@ -575,8 +715,8 @@ impl<'a> Worker<'a> {
         self.rows += 1;
     }
 
-    fn partition(&mut self, visit_blocks: &[Vec<Visit>], click_blocks: &[Vec<Click>]) {
-        let total: usize = visit_blocks.iter().map(Vec::len).sum();
+    fn partition(&mut self, visit_blocks: &[Block<Visit>], click_blocks: &[Block<Click>]) {
+        let total: usize = visit_blocks.iter().map(|block| block.len).sum();
         if total == 0 {
             return;
         }
@@ -588,7 +728,7 @@ impl<'a> Worker<'a> {
         self.people.clear();
         self.visit_person.clear();
         self.visit_start.clear();
-        for visit in visit_blocks.iter().flatten() {
+        for visit in visit_blocks.iter().flat_map(Block::rows) {
             let person = join(visit.person);
             let mut slot = key::hash(person) as usize & mask;
             let index = loop {
@@ -618,7 +758,7 @@ impl<'a> Worker<'a> {
         self.visits.clear();
         self.visits.resize(total, 0);
         self.purchases.clear();
-        for (visit, &person) in visit_blocks.iter().flatten().zip(&self.visit_person) {
+        for (visit, &person) in visit_blocks.iter().flat_map(Block::rows).zip(&self.visit_person) {
             let mut value = u64::from(visit.ts) << 32;
             if visit.price != 0 {
                 self.purchases.push((visit.price, visit.category));
@@ -632,7 +772,7 @@ impl<'a> Worker<'a> {
         self.click_person.clear();
         self.click_start.clear();
         self.click_start.resize(people + 1, 0);
-        for click in click_blocks.iter().flatten() {
+        for click in click_blocks.iter().flat_map(Block::rows) {
             let person = join(click.person);
             let mut slot = key::hash(person) as usize & mask;
             let index = loop {
@@ -656,7 +796,7 @@ impl<'a> Worker<'a> {
         }
         self.clicks.clear();
         self.clicks.resize(sum as usize, PersonClick { id: 0, ts: 0, campaign: 0 });
-        for (click, &person) in click_blocks.iter().flatten().zip(&self.click_person) {
+        for (click, &person) in click_blocks.iter().flat_map(Block::rows).zip(&self.click_person) {
             if person != u32::MAX {
                 let at = &mut self.click_start[person as usize];
                 self.clicks[*at as usize] = PersonClick { id: join(click.id), ts: click.ts, campaign: click.campaign };
@@ -786,6 +926,9 @@ fn main() {
         .ok()
         .filter(|&count| count > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, usize::from));
+    // Address space for the large allocations: generous, since only touched pages count.
+    let memory = env("MEM_GB", "0").parse::<usize>().ok().filter(|&gb| gb > 0).unwrap_or(16);
+    bump::reserve(memory << 30);
     let log = |stage: &str| eprintln!("{:8.3}s {stage}", started.elapsed().as_secs_f64());
 
     let manifest = fs::read(data_dir.join("manifest.json")).unwrap_or_else(|error| fail(&format!("manifest.json: {error}")));
@@ -843,29 +986,60 @@ fn main() {
     let files = &files;
     log("mapped inputs");
 
-    // 1 and 2. One thread parses the links and joins them while the others start
-    // on the events; the clicks wait for the links, since they are sent by person.
-    let links: OnceLock<KeyMap<Key>> = OnceLock::new();
+    // 1. Links: parse and number the IDs with every thread, then one thread joins
+    // them while the others start on the events.
+    let next = AtomicUsize::new(0);
+    let sides: Vec<(Vec<Vec<Side>>, usize)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (link_tasks, next) = (&link_tasks, &next);
+                scope.spawn(move || {
+                    let mut sides: Vec<Vec<Side>> = (0..SHARDS).map(|_| Vec::new()).collect();
+                    let mut count = 0u32;
+                    while let Some(&(file, start, end)) = link_tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let data = files[file].bytes();
+                        scan::scan::<2>(data, start, end, |fields| {
+                            let a = key::key(data, fields[0].0, fields[0].1);
+                            let b = key::key(data, fields[1].0, fields[1].1);
+                            // A self-link changes nothing: an ID alone is its own person anyway.
+                            if a != 0 && b != 0 && a != b {
+                                for (key, side) in [(a, 0), (b, 1)] {
+                                    sides[(key::hash(key) >> (64 - SHARD_BITS)) as usize].push((key, count << 1 | side));
+                                }
+                                count += 1;
+                            }
+                        });
+                    }
+                    (sides, count as usize)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+    log("links parsed");
+    let (sides, counts): (Vec<_>, Vec<usize>) = sides.into_iter().unzip();
+    let shards: Vec<Mutex<Shard>> = (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| number_ids(&sides, &shards, &next));
+        }
+    });
+    log("links parsed and numbered");
+
+    // 2. Events, then clicks. The clicks wait for the links, since they are sent by person.
+    let links: OnceLock<Links> = OnceLock::new();
+    let shards = Mutex::new(Some(shards));
     let (next_event, next_click) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let parsed: Vec<(Vec<Part<Event>>, Vec<Part<Click>>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (links, link_tasks, event_tasks, click_tasks) = (&links, &link_tasks, &event_tasks, &click_tasks);
-                let (next_event, next_click) = (&next_event, &next_click);
+                let (links, sides, counts, shards) = (&links, &sides, &counts, &shards);
+                let (event_tasks, click_tasks, next_event, next_click) = (&event_tasks, &click_tasks, &next_event, &next_click);
                 scope.spawn(move || {
                     if thread == 0 {
-                        let mut pairs = Vec::new();
-                        for &(file, start, end) in link_tasks {
-                            let data = files[file].bytes();
-                            scan::scan::<2>(data, start, end, |fields| {
-                                let a = key::key(data, fields[0].0, fields[0].1);
-                                let b = key::key(data, fields[1].0, fields[1].1);
-                                if a != 0 && b != 0 && a != b {
-                                    pairs.push((a, b));
-                                }
-                            });
-                        }
-                        let _ = links.set(build_links(vec![pairs]));
+                        let shards = shards.lock().unwrap().take().unwrap();
+                        let _ = links.set(join_links(sides, counts, shards));
                         log("links joined");
                     }
                     let (mut events, mut clicks) = (parts(), parts());
@@ -902,9 +1076,10 @@ fn main() {
                     let mut out = parts();
                     let mut table = Vec::new();
                     while let Some(blocks) = events.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let mut blocks = std::mem::take(&mut *blocks.lock().unwrap());
-                        dedup(&mut blocks, &mut table, links, &mut out);
-                        std::mem::forget(blocks); // freed at exit; unmapping now would only cost time
+                        let blocks = std::mem::take(&mut *blocks.lock().unwrap());
+                        dedup(&blocks, &mut table, links, &mut out);
+                        // The survivors of later partitions go into these blocks.
+                        blocks.into_iter().for_each(Block::recycle);
                     }
                     out
                 })
@@ -936,7 +1111,6 @@ fn main() {
                         let visit_blocks = std::mem::take(&mut *visits[at].lock().unwrap());
                         let click_blocks = std::mem::take(&mut *clicks[at].lock().unwrap());
                         worker.partition(&visit_blocks, &click_blocks);
-                        std::mem::forget((visit_blocks, click_blocks));
                     }
                     worker.flush();
                     let wrote = worker.writer.is_some();
