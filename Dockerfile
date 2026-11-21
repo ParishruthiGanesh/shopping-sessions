@@ -5,11 +5,11 @@ FROM rust:1.97-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcb
 WORKDIR /src
 COPY native/ ./
 # Cargo.lock pins every dependency; --locked refuses to build if it would change.
+# The binary is statically linked (native/.cargo/config.toml), so it runs on an empty image.
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+FROM scratch
+# The scorer runs the container as uid 1000 with HOME=/scratch; nothing here needs a passwd entry.
 COPY --from=build /src/target/release/shopping-sessions /app/shopping-sessions
 # No arguments: reads $DATA_DIR, writes $OUTPUT_DIR. Exit 0 means "done".
 CMD ["/app/shopping-sessions"]
