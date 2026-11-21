@@ -1,14 +1,18 @@
 //! Shopping Sessions, native pipeline. rules.md is the specification; the
 //! stages below follow its order.
 //!
-//!   1. links    parse, union-find, name each person by their smallest ID
+//!   1. links    parse, union-find (lock-free, all threads), name each person
+//!               by their smallest ID
 //!   2. parse    events and clicks, in parallel over chunks of the mapped files;
-//!               each event copy is validated on the spot and sent to a
-//!               partition chosen by its event_id
-//!   3. dedup    per partition: keep the earliest-ingested copy of each event,
-//!               then send the valid survivors to a partition chosen by person
-//!   4. sessions per partition: group by person, sort by time, sessionize,
-//!               credit and assist, and write the user_daily rows
+//!               each event copy is validated on the spot. A valid copy goes
+//!               straight to its person's partition as a 12-byte Visit, the one
+//!               shuffle of the events; every copy, valid or not, also leaves a
+//!               16-byte Sighting (event_id, ingest_ts, where the Visit went),
+//!               bucketed by event_id
+//!   3. dedup    per bucket of Sightings: every copy but the earliest-ingested
+//!               of each event_id is marked killed in its partition
+//!   4. sessions per partition: drop the killed Visits, group by person, sort
+//!               by time, sessionize, credit and assist, write user_daily rows
 //!   5. campaign_daily from the per-thread totals
 
 // The scanners and the ID packing are written for AVX2. Cargo reads native/.cargo/config.toml
@@ -28,8 +32,8 @@ static ALLOCATOR: bump::Bump = bump::Bump;
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use key::{Key, KeyMap};
@@ -38,7 +42,6 @@ use time::DAY;
 
 const PARTITION_BITS: u32 = 8;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
-const BLOCK_BITS: u32 = 12;
 const CHUNK: usize = 1 << 18;
 const INVALID: u32 = u32::MAX;
 const SESSION_GAP: u32 = 30 * 60 * 1000;
@@ -152,8 +155,11 @@ fn manifest_time(text: &[u8], name: &str) -> i64 {
 // ------------------------------------------------------------------ records
 
 /// Bytes per block of rows. Every row type uses the same size, so a block
-/// that one stage has finished with can hold another stage's rows.
-const BLOCK_BYTES: usize = 48 << BLOCK_BITS;
+/// that one stage has finished with can hold another stage's rows. Small, since
+/// every thread has a block open for each stream and partition, and the huge
+/// pages of the bump region are zeroed whole when first touched (24 KB rather
+/// than 192 KB: 3.9 -> 3.1 GB peak at 20M events, and 0.035 s faster).
+const BLOCK_BYTES: usize = 48 << 9;
 const SLAB_BYTES: usize = 64 * BLOCK_BYTES;
 
 /// A thread's supply of blocks: carved from large slabs, and reused when given back.
@@ -220,24 +226,29 @@ const STAGE: usize = 192;
 #[repr(C, align(64))]
 struct Stage([u8; STAGE]);
 
-/// Rows headed for one partition, in fixed-size blocks so nothing is ever moved.
+/// One thread's rows headed for each of the partitions, in fixed-size blocks so
+/// nothing is ever moved.
 ///
-/// Rows are gathered in a small staging buffer that stays in the L1 cache and
-/// written to the block three whole cache lines at a time with streaming
-/// stores. Writing rows straight to 256 blocks made every store miss: each
-/// new line had to be read from memory before it could be written.
-struct Part<T> {
-    stage: Stage,
-    staged: usize,
-    blocks: Vec<Block<T>>,
-    current: *mut T,
-    /// Rows written to the current block.
-    len: usize,
+/// Rows are gathered in a small staging buffer per partition and written to the
+/// block three whole cache lines at a time with streaming stores. Writing rows
+/// straight to 256 blocks made every store miss: each new line had to be read
+/// from memory before it could be written. The counts that say where the next
+/// row goes are kept apart, in one small array that stays in the L1 cache, so a
+/// row costs one staging line and nothing else.
+struct Parts<T> {
+    /// Rows pushed to each partition: the number the next one gets. Buffers are
+    /// written out whenever they fill, so the count also says how full each is.
+    counts: Vec<u32>,
+    stages: Vec<Stage>,
+    /// The block being filled, and how many rows are in it.
+    current: Vec<*mut T>,
+    filled: Vec<usize>,
+    blocks: Vec<Vec<Block<T>>>,
 }
 // SAFETY: as for Block.
-unsafe impl<T: Send> Send for Part<T> {}
+unsafe impl<T: Send> Send for Parts<T> {}
 
-impl<T> Part<T> {
+impl<T> Parts<T> {
     /// Rows per staging buffer. A block holds a whole number of buffers, and
     /// starts on a page, so every write of the buffer starts on a cache line.
     const PER_STAGE: usize = {
@@ -246,90 +257,115 @@ impl<T> Part<T> {
     };
 
     fn new() -> Self {
-        // "Full" until the first write, so that empty partitions cost nothing.
-        Self { stage: Stage([0; STAGE]), staged: 0, blocks: Vec::new(), current: std::ptr::null_mut(), len: Block::<T>::CAPACITY }
+        Self {
+            counts: vec![0; PARTITIONS],
+            stages: (0..PARTITIONS).map(|_| Stage([0; STAGE])).collect(),
+            current: vec![std::ptr::null_mut(); PARTITIONS],
+            // "Full" until the first write, so that empty partitions cost nothing.
+            filled: vec![Block::<T>::CAPACITY; PARTITIONS],
+            blocks: (0..PARTITIONS).map(|_| Vec::new()).collect(),
+        }
     }
+
+    #[inline(always)]
+    fn count(&self, at: usize) -> u32 {
+        self.counts[at]
+    }
+
+    #[inline(always)]
+    fn push(&mut self, at: usize, value: T) {
+        // SAFETY: `at` is a partition number, below PARTITIONS, the length of
+        // every list; the staged count is below PER_STAGE, so the row fits.
+        unsafe {
+            let count = self.counts.get_unchecked_mut(at);
+            let staged = *count as usize % Self::PER_STAGE;
+            *count += 1;
+            self.stages.get_unchecked_mut(at).0.as_mut_ptr().cast::<T>().add(staged).write_unaligned(value);
+            if staged + 1 == Self::PER_STAGE {
+                self.drain(at);
+            }
+        }
+    }
+
     #[cold]
     #[inline(never)]
-    fn grow(&mut self) {
-        if !self.current.is_null() {
-            self.blocks.push(Block { rows: self.current, len: self.len });
+    fn grow(&mut self, at: usize) {
+        if !self.current[at].is_null() {
+            self.blocks[at].push(Block { rows: self.current[at], len: self.filled[at] });
         }
-        self.current = Arena::take().cast();
-        self.len = 0;
+        self.current[at] = Arena::take().cast();
+        self.filled[at] = 0;
     }
-    #[inline(always)]
-    fn push(&mut self, value: T) {
-        // SAFETY: `staged` is below PER_STAGE, so the row fits in the buffer.
-        unsafe { self.stage.0.as_mut_ptr().cast::<T>().add(self.staged).write_unaligned(value) };
-        self.staged += 1;
-        if self.staged == Self::PER_STAGE {
-            self.drain();
-        }
-    }
+
     /// Writes the full staging buffer to the block.
     #[inline(never)]
-    fn drain(&mut self) {
-        if self.len == Block::<T>::CAPACITY {
-            self.grow();
+    fn drain(&mut self, at: usize) {
+        if self.filled[at] == Block::<T>::CAPACITY {
+            self.grow(at);
         }
         // SAFETY: the block has room for PER_STAGE more rows (its capacity is a
         // multiple of PER_STAGE), and the destination is 64-byte aligned.
         unsafe {
             use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
-            let to = self.current.add(self.len).cast::<__m256i>();
-            let from = self.stage.0.as_ptr().cast::<__m256i>();
-            for at in 0..STAGE / 32 {
-                _mm256_stream_si256(to.add(at), _mm256_load_si256(from.add(at)));
+            let to = self.current[at].add(self.filled[at]).cast::<__m256i>();
+            let from = self.stages[at].0.as_ptr().cast::<__m256i>();
+            for step in 0..STAGE / 32 {
+                _mm256_stream_si256(to.add(step), _mm256_load_si256(from.add(step)));
             }
         }
-        self.len += Self::PER_STAGE;
-        self.staged = 0;
+        self.filled[at] += Self::PER_STAGE;
     }
-    /// Writes out a partly filled staging buffer. Call on the thread that pushed,
-    /// before the rows are read anywhere; `seal` then orders the streaming stores.
-    fn finish(&mut self) {
-        if self.staged == 0 {
-            return;
+
+    /// Writes out every partly filled staging buffer and makes the streaming
+    /// stores visible to other threads. Call on the thread that pushed, last.
+    fn seal(&mut self) {
+        for at in 0..PARTITIONS {
+            let staged = self.counts[at] as usize % Self::PER_STAGE;
+            if staged == 0 {
+                continue;
+            }
+            if self.filled[at] == Block::<T>::CAPACITY {
+                self.grow(at);
+            }
+            // SAFETY: `staged` rows are in the buffer and fit in the block, which
+            // has room for a whole buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.stages[at].0.as_ptr(), self.current[at].add(self.filled[at]).cast::<u8>(), staged * std::mem::size_of::<T>());
+            }
+            self.filled[at] += staged;
         }
-        if self.len == Block::<T>::CAPACITY {
-            self.grow();
-        }
-        // SAFETY: `staged` rows are in the buffer and fit in the block, which has
-        // room for a whole buffer.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.stage.0.as_ptr(), self.current.add(self.len).cast::<u8>(), self.staged * std::mem::size_of::<T>());
-        }
-        self.len += self.staged;
-        self.staged = 0;
+        // SAFETY: a store fence has no preconditions.
+        unsafe { std::arch::x86_64::_mm_sfence() };
     }
-    fn into_blocks(mut self) -> Vec<Block<T>> {
-        assert!(self.staged == 0, "a partition was not sealed");
-        if !self.current.is_null() {
-            self.blocks.push(Block { rows: self.current, len: self.len });
+
+    /// Each partition's blocks. Call after `seal`.
+    fn into_blocks(mut self) -> Vec<Vec<Block<T>>> {
+        for at in 0..PARTITIONS {
+            if !self.current[at].is_null() {
+                self.blocks[at].push(Block { rows: self.current[at], len: self.filled[at] });
+            }
         }
         self.blocks
     }
 }
 
-/// Finishes every partition of this thread and makes its streaming stores
-/// visible to other threads. Call on the thread that pushed.
-fn seal<T>(parts: &mut [Part<T>]) {
-    parts.iter_mut().for_each(Part::finish);
-    // SAFETY: a store fence has no preconditions.
-    unsafe { std::arch::x86_64::_mm_sfence() };
-}
-
-fn parts<T>() -> Vec<Part<T>> {
-    (0..PARTITIONS).map(|_| Part::new()).collect()
-}
-
 /// Regroups each thread's partitions into one list of blocks per partition.
-fn gather<T>(threads: Vec<Vec<Part<T>>>) -> Vec<Mutex<Vec<Block<T>>>> {
+fn gather<T>(threads: Vec<Parts<T>>) -> Vec<Mutex<Vec<Block<T>>>> {
     let mut out: Vec<Vec<Block<T>>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
     for thread in threads {
-        for (at, part) in thread.into_iter().enumerate() {
-            out[at].extend(part.into_blocks());
+        for (at, blocks) in thread.into_blocks().into_iter().enumerate() {
+            out[at].extend(blocks);
+        }
+    }
+    out.into_iter().map(Mutex::new).collect()
+}
+
+/// Regroups each thread's partitions into one list per partition of each thread's blocks, in thread order.
+fn gather_threads<T>(threads: Vec<Parts<T>>) -> Vec<Mutex<Vec<Vec<Block<T>>>>> {
+    let mut out: Vec<Vec<Vec<Block<T>>>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
+    for thread in threads {
+        for (at, blocks) in thread.into_blocks().into_iter().enumerate() {
+            out[at].push(blocks);
         }
     }
     out.into_iter().map(Mutex::new).collect()
@@ -340,25 +376,45 @@ fn partition(key: Key) -> usize {
     (key::hash(key) >> (64 - PARTITION_BITS)) as usize
 }
 
-/// One copy of an event. `ts` is INVALID when the copy fails validation or is
-/// late: it still takes part in the dedup, and if it is the kept copy the event is dropped.
+/// A valid copy of an event, sent to its person's partition. `ts` is milliseconds
+/// since `base` (below 2^31), with PURCHASE set for a purchase: its price and
+/// category are in the partition's purchase rows, in the same order.
+#[derive(Clone, Copy)]
 #[repr(C)]
-struct Event {
-    id: Key,
-    user: Key,
-    ingest: u32, // seconds
-    ts: u32,     // milliseconds since `base`
-    price: u32,  // 0 unless a purchase
+struct Visit {
+    person: [u32; 2],
+    ts: u32,
+}
+
+const PURCHASE: u32 = 1 << 31;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Purchase {
+    price: u32,
     category: u32,
 }
 
-/// A surviving event, by person.
+/// Every copy of an event, valid or not, by event_id: what the dedup looks at.
+/// `place` says where the copy's Visit went: its partition << 24 and its number
+/// among the Visits this thread sent there, or NOWHERE for an invalid copy.
 #[repr(C)]
-struct Visit {
-    person: Key,
-    ts: u32,
-    price: u32,
-    category: u32,
+struct Sighting {
+    id: Key,
+    ingest: u32, // seconds
+    place: u32,
+}
+
+const NOWHERE: u32 = u32::MAX;
+const NUMBER_BITS: u32 = 24;
+
+#[inline(always)]
+fn halves(key: Key) -> [u32; 2] {
+    [key as u32, (key >> 32) as u32]
+}
+#[inline(always)]
+fn whole(halves: [u32; 2]) -> Key {
+    u64::from(halves[0]) | u64::from(halves[1]) << 32
 }
 
 /// A valid click, by person.
@@ -449,62 +505,213 @@ fn number_ids(sides: &[Vec<Vec<Side>>], shards: &[Mutex<Shard>], next: &AtomicUs
     }
 }
 
-/// Step 2, by one thread: union-find over the numbers, then name each person.
-fn join_links(sides: &[Vec<Vec<Side>>], counts: &[usize], shards: Vec<Mutex<Shard>>) -> Links {
-    let mut shards: Vec<Shard> = shards.into_iter().map(|shard| shard.into_inner().unwrap()).collect();
-    let mut bases = Vec::with_capacity(SHARDS);
-    let mut keys: Vec<Key> = Vec::new();
-    for shard in &shards {
-        bases.push(keys.len() as u32);
-        keys.extend_from_slice(&shard.keys);
+/// Runs `work` on `threads` threads and waits for all of them.
+fn parallel(threads: usize, work: impl Fn() + Sync) {
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(&work);
+        }
+    });
+}
+
+/// The root of `at` in a union-find forest shared by threads. A parent always
+/// has a higher number than its child, so the forest stays acyclic whatever the
+/// interleaving; pointing a node at its grandparent (path splitting) keeps that true.
+#[inline(always)]
+fn find(parent: &[AtomicU32], mut at: u32) -> u32 {
+    loop {
+        let up = parent[at as usize].load(Ordering::Relaxed);
+        if up == at {
+            return at;
+        }
+        let above = parent[up as usize].load(Ordering::Relaxed);
+        if above != up {
+            parent[at as usize].store(above, Ordering::Relaxed);
+        }
+        at = up;
     }
-    // Each link's two IDs, numbered across all shards.
+}
+
+/// Joins the sets of `a` and `b`: the root with the lower number goes under the other.
+#[inline(always)]
+fn union(parent: &[AtomicU32], mut a: u32, mut b: u32) {
+    loop {
+        (a, b) = (find(parent, a), find(parent, b));
+        if a == b {
+            return;
+        }
+        let (low, high) = (a.min(b), a.max(b));
+        // Only a root's parent is ever swapped; if `low` stopped being a root, look again.
+        if parent[low as usize].compare_exchange(low, high, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+/// Step 2, by every thread: union-find over the numbers, then name each person by
+/// their smallest ID and write the name into every shard.
+fn join_links(sides: &[Vec<Vec<Side>>], counts: &[usize], shards: Vec<Mutex<Shard>>, threads: usize) -> Links {
+    let mut bases = Vec::with_capacity(SHARDS);
+    let mut total = 0usize;
+    for shard in &shards {
+        bases.push(total as u32);
+        total += shard.lock().unwrap().keys.len();
+    }
+    assert!(total < u32::MAX as usize, "too many linked IDs");
     let starts: Vec<usize> = counts.iter().scan(0, |sum, &count| Some(std::mem::replace(sum, *sum + count))).collect();
-    let mut links = vec![[0u32; 2]; counts.iter().sum()];
-    for (shard_at, shard) in shards.iter().enumerate() {
+    let link_count: usize = counts.iter().sum();
+    // Each link's two IDs, numbered across all shards.
+    let links: Vec<AtomicU32> = (0..2 * link_count).map(|_| AtomicU32::new(0)).collect();
+    let parent: Vec<AtomicU32> = (0..total as u32).map(AtomicU32::new).collect();
+    let next = AtomicUsize::new(0);
+    parallel(threads, || loop {
+        let shard_at = next.fetch_add(1, Ordering::Relaxed);
+        if shard_at >= SHARDS {
+            return;
+        }
+        let shard = shards[shard_at].lock().unwrap();
         for ((thread, numbers), &start) in sides.iter().zip(&shard.numbers).zip(&starts) {
             for (&(_, side), &local) in thread[shard_at].iter().zip(numbers) {
-                links[start + (side >> 1) as usize][(side & 1) as usize] = bases[shard_at] + local;
+                links[2 * (start + (side >> 1) as usize) + (side & 1) as usize].store(bases[shard_at] + local, Ordering::Relaxed);
             }
         }
-    }
-    let mut parent: Vec<u32> = (0..keys.len() as u32).collect();
-    fn find(parent: &mut [u32], mut at: u32) -> u32 {
-        let mut root = at;
-        while parent[root as usize] != root {
-            root = parent[root as usize];
+    });
+    const SPAN: usize = 1 << 14;
+    let next = AtomicUsize::new(0);
+    parallel(threads, || loop {
+        let from = next.fetch_add(SPAN, Ordering::Relaxed);
+        if from >= link_count {
+            return;
         }
-        while parent[at as usize] != root {
-            at = std::mem::replace(&mut parent[at as usize], root);
+        for link in from..(from + SPAN).min(link_count) {
+            union(&parent, links[2 * link].load(Ordering::Relaxed), links[2 * link + 1].load(Ordering::Relaxed));
         }
-        root
-    }
-    for &[a, b] in &links {
-        let (a, b) = (find(&mut parent, a), find(&mut parent, b));
-        if a != b {
-            parent[a as usize] = b;
+    });
+    // Every ID points at its root; each root gets its smallest packed ID. Packed IDs
+    // compare as integers; the rare interned ones are compared byte-wise after.
+    let name: Vec<AtomicU64> = (0..total).map(|_| AtomicU64::new(u64::MAX)).collect();
+    let interned: Mutex<Vec<(u32, Key)>> = Mutex::new(Vec::new());
+    let next = AtomicUsize::new(0);
+    parallel(threads, || loop {
+        let shard_at = next.fetch_add(1, Ordering::Relaxed);
+        if shard_at >= SHARDS {
+            return;
+        }
+        let shard = shards[shard_at].lock().unwrap();
+        for (local, &key) in shard.keys.iter().enumerate() {
+            let at = bases[shard_at] + local as u32;
+            let root = find(&parent, at);
+            parent[at as usize].store(root, Ordering::Relaxed);
+            if key::is_long(key) {
+                interned.lock().unwrap().push((root, key));
+            } else {
+                name[root as usize].fetch_min(key, Ordering::Relaxed);
+            }
+        }
+    });
+    for (root, key) in interned.into_inner().unwrap() {
+        let name = &name[root as usize];
+        let current = name.load(Ordering::Relaxed);
+        if current == u64::MAX || key::compare(key, current).is_lt() {
+            name.store(key, Ordering::Relaxed);
         }
     }
-    let mut name = keys.clone();
-    for at in 0..keys.len() {
-        let root = find(&mut parent, at as u32) as usize;
-        if key::compare(keys[at], name[root]).is_lt() {
-            name[root] = keys[at];
+    let next = AtomicUsize::new(0);
+    parallel(threads, || loop {
+        let shard_at = next.fetch_add(1, Ordering::Relaxed);
+        if shard_at >= SHARDS {
+            return;
         }
-    }
-    for (shard, &base) in shards.iter_mut().zip(&bases) {
+        let mut shard = shards[shard_at].lock().unwrap();
+        let base = bases[shard_at] as usize;
         for slot in shard.ids.as_mut().unwrap().slots_mut() {
             if slot.0 != 0 {
-                slot.1 = name[parent[base as usize + slot.1 as usize] as usize];
+                let root = parent[base + slot.1 as usize].load(Ordering::Relaxed);
+                slot.1 = name[root as usize].load(Ordering::Relaxed);
             }
         }
-    }
-    Links { shards: shards.into_iter().map(|shard| shard.ids.unwrap()).collect() }
+    });
+    Links { shards: shards.into_iter().map(|shard| shard.into_inner().unwrap().ids.unwrap()).collect() }
 }
 
 // ------------------------------------------------------------------ 2. parse
 
-fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &mut [Part<Event>]) {
+/// A valid event copy waiting for its person to be looked up.
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    user: Key,
+    id: Key,
+    ingest: u32,
+    ts: u32,
+    purchase: Purchase,
+}
+
+/// How many valid copies ahead the person's slot in the links is prefetched.
+const EVENT_AHEAD: usize = 16;
+
+thread_local! {
+    /// The valid copies of the chunk being parsed: small enough to stay in the L2 cache.
+    static PENDING: std::cell::RefCell<Vec<Pending>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Where one thread's parsed events go.
+struct EventParts {
+    visits: Parts<Visit>,
+    purchases: Parts<Purchase>,
+    sightings: Parts<Sighting>,
+}
+
+impl EventParts {
+    fn new() -> Self {
+        Self { visits: Parts::new(), purchases: Parts::new(), sightings: Parts::new() }
+    }
+
+    /// Sends a valid copy to its person's partition, and its sighting to the dedup.
+    #[inline(always)]
+    fn place(&mut self, links: &Links, pending: &Pending) {
+        let person = links.person(pending.user);
+        let at = partition(person);
+        let number = self.visits.count(at);
+        if number >= 1 << NUMBER_BITS {
+            fail("too many events of one partition for one thread");
+        }
+        let purchase = pending.purchase.price != 0;
+        self.visits.push(at, Visit { person: halves(person), ts: pending.ts | if purchase { PURCHASE } else { 0 } });
+        if purchase {
+            self.purchases.push(at, pending.purchase);
+        }
+        self.sight(pending.id, pending.ingest, (at as u32) << NUMBER_BITS | number);
+    }
+
+    #[inline(always)]
+    fn sight(&mut self, id: Key, ingest: u32, place: u32) {
+        self.sightings.push(partition(id), Sighting { id, ingest, place });
+    }
+
+    fn seal(&mut self) {
+        self.visits.seal();
+        self.purchases.seal();
+        self.sightings.seal();
+    }
+}
+
+/// Parses a chunk of events in two passes: the lines into a list of valid copies,
+/// then the copies to their people. Looking people up in the second, short loop
+/// lets many lookups wait on memory at once; inside the parse they stalled it.
+fn parse_events(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut EventParts) {
+    PENDING.with_borrow_mut(|pending| {
+        pending.clear();
+        parse_event_lines(context, data, start, end, out, pending);
+        for (at, copy) in pending.iter().enumerate() {
+            if let Some(ahead) = pending.get(at + EVENT_AHEAD) {
+                links.prefetch(ahead.user);
+            }
+            out.place(links, copy);
+        }
+    });
+}
+
+fn parse_event_lines(context: &Context, data: &[u8], start: usize, end: usize, out: &mut EventParts, pending: &mut Vec<Pending>) {
     let mut dates = time::Dates::new();
     scan::lines::<7>(data, start, end, |fields| {
         // SAFETY: the scan only reports fields inside `data`.
@@ -515,14 +722,8 @@ fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &
         }
         let user = key::key(data, fields[1].0, fields[1].1);
         let ingest = time::parse(field(3), &mut dates);
-        let mut event = Event {
-            id,
-            user,
-            ingest: ingest.map_or(INVALID, |ms| ms.div_euclid(1000).clamp(0, i64::from(INVALID - 1)) as u32),
-            ts: INVALID,
-            price: 0,
-            category: 0,
-        };
+        let ingest_seconds = ingest.map_or(INVALID, |ms| ms.div_euclid(1000).clamp(0, i64::from(INVALID - 1)) as u32);
+        let mut copy = Pending { user, id, ingest: ingest_seconds, ts: INVALID, purchase: Purchase::default() };
         'valid: {
             if user == 0 || fields[5].0 == fields[5].1 {
                 break 'valid;
@@ -546,20 +747,23 @@ fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &
                 if !(1..=10_000_000).contains(&price) {
                     break 'valid;
                 }
-                event.price = price as u32;
                 let product = key::key(data, fields[5].0, fields[5].1);
-                event.category = context.products.get(product).unwrap_or(context.unknown_category);
+                copy.purchase = Purchase { price: price as u32, category: context.products.get(product).unwrap_or(context.unknown_category) };
             } else {
                 break 'valid;
             }
-            event.ts = (ts - context.base) as u32;
+            copy.ts = (ts - context.base) as u32;
         }
-        // SAFETY: a partition number is below PARTITIONS, the length of `out`.
-        unsafe { out.get_unchecked_mut(partition(id)) }.push(event);
+        if copy.ts == INVALID {
+            // An invalid copy still takes part in the dedup: if it is the kept copy, the event is dropped.
+            out.sight(id, ingest_seconds, NOWHERE);
+            return;
+        }
+        pending.push(copy);
     });
 }
 
-fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
+fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut Parts<Click>) {
     let mut dates = time::Dates::new();
     let mut pending: [(Key, Click); CLICK_AHEAD] = std::array::from_fn(|_| (0, Click { person: 0, id: 0, ts: 0, campaign: 0 }));
     let mut taken = 0usize;
@@ -595,10 +799,10 @@ fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end
 const CLICK_AHEAD: usize = 16;
 
 #[inline(always)]
-fn send(links: &Links, (user, click): &mut (Key, Click), out: &mut [Part<Click>]) {
+fn send(links: &Links, (user, click): &mut (Key, Click), out: &mut Parts<Click>) {
     let person = links.person(*user);
     click.person = person;
-    out[partition(person)].push(*click);
+    out.push(partition(person), *click);
 }
 
 // ------------------------------------------------------------------ 3. dedup
@@ -612,8 +816,12 @@ fn prefetch<T>(pointer: *const T) {
     unsafe { std::arch::x86_64::_mm_prefetch(pointer.cast(), std::arch::x86_64::_MM_HINT_T0) };
 }
 
-fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut [Part<Visit>]) {
-    let total: usize = blocks.iter().map(|block| block.len).sum();
+/// The sightings of one bucket of event_ids, `blocks[thread]`: every copy but the
+/// earliest-ingested of each event_id is killed, by adding `thread << 32 | number`
+/// to `kills[partition]`. Copies with equal ingest_ts are identical, so the first
+/// seen is kept. An invalid kept copy (NOWHERE) kills the others and is dropped itself.
+fn dedup(blocks: &[Vec<Block<Sighting>>], table: &mut Vec<u64>, kills: &mut [Vec<u64>]) {
+    let total: usize = blocks.iter().flatten().map(|block| block.len).sum();
     if total == 0 {
         return;
     }
@@ -621,20 +829,23 @@ fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut
     table.clear();
     table.resize(size, 0);
     let mask = size - 1;
-    let bases: Vec<*mut Event> = blocks.iter().map(|block| block.rows).collect();
-    for (block_at, block) in blocks.iter().enumerate() {
-        for at in 0..block.len {
-            if at + DEDUP_AHEAD < block.len {
-                // The table is larger than the L2 cache: ask for the slot of a later event now.
-                // SAFETY: the row is inside the block, and prefetching never faults.
-                let ahead = unsafe { (*bases[block_at].add(at + DEDUP_AHEAD)).id };
-                prefetch(table.as_ptr().wrapping_add(key::hash(ahead) as usize & mask));
+    let flat: Vec<(usize, &Block<Sighting>)> = blocks.iter().enumerate().flat_map(|(thread, blocks)| blocks.iter().map(move |block| (thread, block))).collect();
+    let capacity = Block::<Sighting>::CAPACITY;
+    let mut kill = |thread: usize, place: u32| {
+        if place != NOWHERE {
+            kills[(place >> NUMBER_BITS) as usize].push((thread as u64) << 32 | u64::from(place & ((1 << NUMBER_BITS) - 1)));
+        }
+    };
+    for (block_at, &(thread, block)) in flat.iter().enumerate() {
+        let rows = block.rows();
+        for (at, sighting) in rows.iter().enumerate() {
+            if let Some(ahead) = rows.get(at + DEDUP_AHEAD) {
+                // The table is larger than the L2 cache: ask for the slot of a later sighting now.
+                prefetch(table.as_ptr().wrapping_add(key::hash(ahead.id) as usize & mask));
             }
-            // SAFETY: `at` is inside the block; nothing else holds a reference to this event.
-            let event = unsafe { &mut *bases[block_at].add(at) };
-            let hash = key::hash(event.id);
+            let hash = key::hash(sighting.id);
             let tag = hash & 0xFFFF_FFFF_0000_0000;
-            let entry = tag | ((block_at * Block::<Event>::CAPACITY + at) as u64 + 1);
+            let entry = tag | ((block_at * capacity + at) as u64 + 1);
             let mut slot = hash as usize & mask;
             loop {
                 let seen = table[slot];
@@ -644,33 +855,20 @@ fn dedup(blocks: &[Block<Event>], table: &mut Vec<u64>, links: &Links, out: &mut
                 }
                 if seen & 0xFFFF_FFFF_0000_0000 == tag {
                     let index = (seen as u32 - 1) as usize;
-                    // SAFETY: the index was stored from a valid block and offset, and is not this event.
-                    let (other_block, other_at) = (index / Block::<Event>::CAPACITY, index % Block::<Event>::CAPACITY);
-                    let other = unsafe { &mut *bases[other_block].add(other_at) };
-                    if other.id == event.id {
+                    let (other_thread, other_block) = flat[index / capacity];
+                    let other = &other_block.rows()[index % capacity];
+                    if other.id == sighting.id {
                         // Two copies: the earlier ingest is kept, valid or not.
-                        if event.ingest < other.ingest {
-                            other.ts = INVALID;
+                        if sighting.ingest < other.ingest {
+                            kill(other_thread, other.place);
                             table[slot] = entry;
                         } else {
-                            event.ts = INVALID;
+                            kill(thread, sighting.place);
                         }
                         break;
                     }
                 }
                 slot = (slot + 1) & mask;
-            }
-        }
-    }
-    for block in blocks.iter().map(Block::rows) {
-        for (at, event) in block.iter().enumerate() {
-            if let Some(ahead) = block.get(at + 8) {
-                links.prefetch(ahead.user);
-            }
-            if event.ts != INVALID {
-                let user = event.user;
-                let person = links.person(user);
-                out[partition(person)].push(Visit { person, ts: event.ts, price: event.price, category: event.category });
             }
         }
     }
@@ -713,6 +911,8 @@ struct Worker<'a> {
     people: Vec<Key>,
     visit_person: Vec<u32>,
     visit_start: Vec<u32>,
+    thread_offsets: Vec<usize>,
+    killed: Vec<u64>,
     visits: Vec<u64>,
     purchases: Vec<(u32, u32)>,
     click_person: Vec<u32>,
@@ -747,6 +947,8 @@ impl<'a> Worker<'a> {
             people: Vec::new(),
             visit_person: Vec::new(),
             visit_start: Vec::new(),
+            thread_offsets: Vec::new(),
+            killed: Vec::new(),
             visits: Vec::new(),
             purchases: Vec::new(),
             click_person: Vec::new(),
@@ -827,10 +1029,30 @@ impl<'a> Worker<'a> {
         self.rows += 1;
     }
 
-    fn partition(&mut self, visit_blocks: &[Block<Visit>], click_blocks: &[Block<Click>]) {
-        let total: usize = visit_blocks.iter().map(|block| block.len).sum();
+    /// One partition: its Visits by thread, its purchases by thread (one per
+    /// Visit with PURCHASE, in the same order), the Visits the dedup killed
+    /// (`thread << 32 | number`), and its clicks.
+    fn partition(&mut self, visit_blocks: &[Vec<Block<Visit>>], purchase_blocks: &[Vec<Block<Purchase>>], kills: &[u64], click_blocks: &[Block<Click>]) {
+        let total: usize = visit_blocks.iter().flatten().map(|block| block.len).sum();
         if total == 0 {
             return;
+        }
+        // The killed Visits, as a bit per Visit in thread order.
+        let mut offset = 0usize;
+        self.thread_offsets.clear();
+        for blocks in visit_blocks {
+            self.thread_offsets.push(offset);
+            offset += blocks.iter().map(|block| block.len).sum::<usize>();
+        }
+        self.killed.clear();
+        self.killed.resize(total.div_ceil(64), 0);
+        for &kill in kills {
+            let at = self.thread_offsets[(kill >> 32) as usize] + (kill as u32) as usize;
+            self.killed[at / 64] |= 1 << (at % 64);
+        }
+        self.purchases.clear();
+        for block in purchase_blocks.iter().flatten() {
+            self.purchases.extend(block.rows().iter().map(|purchase| (purchase.price, purchase.category)));
         }
         // Number the people of this partition and count their events.
         let size = (total * 2).next_power_of_two();
@@ -840,8 +1062,12 @@ impl<'a> Worker<'a> {
         self.people.clear();
         self.visit_person.clear();
         self.visit_start.clear();
-        for visit in visit_blocks.iter().flat_map(Block::rows) {
-            let person = visit.person;
+        for (at, visit) in visit_blocks.iter().flatten().flat_map(Block::rows).enumerate() {
+            if self.killed[at / 64] >> (at % 64) & 1 != 0 {
+                self.visit_person.push(u32::MAX);
+                continue;
+            }
+            let person = whole(visit.person);
             let mut slot = key::hash(person) as usize & mask;
             let index = loop {
                 let seen = self.table[slot];
@@ -868,17 +1094,20 @@ impl<'a> Worker<'a> {
         }
         self.visit_start.push(sum);
         self.visits.clear();
-        self.visits.resize(total, 0);
-        self.purchases.clear();
-        for (visit, &person) in visit_blocks.iter().flat_map(Block::rows).zip(&self.visit_person) {
-            let mut value = u64::from(visit.ts) << 32;
-            if visit.price != 0 {
-                self.purchases.push((visit.price, visit.category));
-                value |= self.purchases.len() as u64;
+        self.visits.resize(sum as usize, 0);
+        let mut purchase_at = 0u64;
+        for (visit, &person) in visit_blocks.iter().flatten().flat_map(Block::rows).zip(&self.visit_person) {
+            let mut value = u64::from(visit.ts & !PURCHASE) << 32;
+            if visit.ts & PURCHASE != 0 {
+                // Killed or not, a purchase Visit has its purchase row.
+                purchase_at += 1;
+                value |= purchase_at;
             }
-            let at = &mut self.visit_start[person as usize];
-            self.visits[*at as usize] = value;
-            *at += 1;
+            if person != u32::MAX {
+                let at = &mut self.visit_start[person as usize];
+                self.visits[*at as usize] = value;
+                *at += 1;
+            }
         }
         // The same for the clicks of people who have events.
         self.click_person.clear();
@@ -1160,74 +1389,72 @@ fn main() {
         }
     });
     log("links parsed and numbered");
+    let links = join_links(&sides, &counts, shards, threads);
+    drop(sides);
+    let links = &links;
+    log("links joined");
 
-    // 2. Events, then clicks. The clicks wait for the links, since they are sent by person.
-    let links: OnceLock<Links> = OnceLock::new();
-    let shards = Mutex::new(Some(shards));
+    // 2. Events, then clicks.
     let (next_event, next_click) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let parsed: Vec<(Vec<Part<Event>>, Vec<Part<Click>>)> = std::thread::scope(|scope| {
+    let parsed: Vec<(EventParts, Parts<Click>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| {
-                let (links, sides, counts, shards) = (&links, &sides, &counts, &shards);
+            .map(|_| {
                 let (event_tasks, click_tasks, next_event, next_click) = (&event_tasks, &click_tasks, &next_event, &next_click);
                 scope.spawn(move || {
-                    if thread == 0 {
-                        let shards = shards.lock().unwrap().take().unwrap();
-                        let _ = links.set(join_links(sides, counts, shards));
-                        log("links joined");
-                    }
-                    let (mut events, mut clicks) = (parts(), parts());
+                    let (mut events, mut clicks) = (EventParts::new(), Parts::new());
                     while let Some(&(file, start, end)) = event_tasks.get(next_event.fetch_add(1, Ordering::Relaxed)) {
-                        parse_events(context, files[file].bytes(), start, end, &mut events);
+                        parse_events(context, links, files[file].bytes(), start, end, &mut events);
                     }
-                    let links = loop {
-                        match links.get() {
-                            Some(links) => break links,
-                            None => std::thread::yield_now(),
-                        }
-                    };
                     while let Some(&(file, start, end)) = click_tasks.get(next_click.fetch_add(1, Ordering::Relaxed)) {
                         parse_clicks(context, links, files[file].bytes(), start, end, &mut clicks);
                     }
-                    seal(&mut events);
-                    seal(&mut clicks);
+                    events.seal();
+                    clicks.seal();
                     (events, clicks)
                 })
             })
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
-    let links = links.get().unwrap();
-    let (events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
-    let (events, clicks) = (gather(events), gather(clicks));
+    let (mut visits, mut purchases, mut sightings, mut clicks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (events, thread_clicks) in parsed {
+        visits.push(events.visits);
+        purchases.push(events.purchases);
+        sightings.push(events.sightings);
+        clicks.push(thread_clicks);
+    }
+    let (visits, purchases, sightings, clicks) = (gather_threads(visits), gather_threads(purchases), gather_threads(sightings), gather(clicks));
     log("parsed events and clicks");
 
-    // 3. Dedup each event partition and regroup the survivors by person.
+    // 3. Dedup: each bucket of event_ids marks the copies to drop, by partition.
     let next = AtomicUsize::new(0);
-    let visits: Vec<Vec<Part<Visit>>> = std::thread::scope(|scope| {
+    let thread_kills: Vec<Vec<Vec<u64>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
-                let (events, next) = (&events, &next);
+                let (sightings, next) = (&sightings, &next);
                 scope.spawn(move || {
-                    let mut out = parts();
+                    let mut kills: Vec<Vec<u64>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
                     let mut table = Vec::new();
-                    while let Some(blocks) = events.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    while let Some(blocks) = sightings.get(next.fetch_add(1, Ordering::Relaxed)) {
                         let blocks = std::mem::take(&mut *blocks.lock().unwrap());
-                        dedup(&blocks, &mut table, links, &mut out);
-                        // The survivors of later partitions go into these blocks.
-                        blocks.into_iter().for_each(Block::recycle);
+                        dedup(&blocks, &mut table, &mut kills);
+                        blocks.into_iter().flatten().for_each(Block::recycle);
                     }
-                    seal(&mut out);
-                    out
+                    kills
                 })
             })
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
-    let visits = gather(visits);
+    let mut kills: Vec<Vec<u64>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
+    for thread in thread_kills {
+        for (at, list) in thread.into_iter().enumerate() {
+            kills[at].extend(list);
+        }
+    }
     // Largest partitions first (a whale's can take ten times the average), so the threads finish together.
     let mut order: Vec<usize> = (0..PARTITIONS).collect();
-    order.sort_by_cached_key(|&at| std::cmp::Reverse(visits[at].lock().unwrap().iter().map(|block| block.len).sum::<usize>()));
+    order.sort_by_cached_key(|&at| std::cmp::Reverse(visits[at].lock().unwrap().iter().flatten().map(|block| block.len).sum::<usize>()));
     log("deduplicated events");
 
     // 4. Sessions, credit and assists per person partition; each thread writes its own user_daily file.
@@ -1240,14 +1467,15 @@ fn main() {
     let totals: Vec<(Vec<CampaignDay>, bool)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (visits, clicks, next, user_dir, order) = (&visits, &clicks, &next, &user_dir, &order);
+                let (visits, purchases, kills, clicks, next, user_dir, order) = (&visits, &purchases, &kills, &clicks, &next, &user_dir, &order);
                 scope.spawn(move || {
                     let mut worker = Worker::new(context, user_dir.join(format!("part-{thread}.parquet")));
                     loop {
                         let Some(&at) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
                         let visit_blocks = std::mem::take(&mut *visits[at].lock().unwrap());
+                        let purchase_blocks = std::mem::take(&mut *purchases[at].lock().unwrap());
                         let click_blocks = std::mem::take(&mut *clicks[at].lock().unwrap());
-                        worker.partition(&visit_blocks, &click_blocks);
+                        worker.partition(&visit_blocks, &purchase_blocks, &kills[at], &click_blocks);
                     }
                     worker.flush();
                     let wrote = worker.writer.is_some();
