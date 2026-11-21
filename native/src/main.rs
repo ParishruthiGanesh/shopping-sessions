@@ -763,46 +763,40 @@ fn parse_event_lines(context: &Context, data: &[u8], start: usize, end: usize, o
     });
 }
 
-fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut Parts<Click>) {
-    let mut dates = time::Dates::new();
-    let mut pending: [(Key, Click); CLICK_AHEAD] = std::array::from_fn(|_| (0, Click { person: 0, id: 0, ts: 0, campaign: 0 }));
-    let mut taken = 0usize;
-    scan::lines::<4>(data, start, end, |fields| {
-        // Copies of a click are identical and nothing counts clicks, so no dedup is needed:
-        // a second copy can never change which campaign is credited or assists.
-        let id = key::key(data, fields[0].0, fields[0].1);
-        let user = key::key(data, fields[1].0, fields[1].1);
-        if id == 0 || user == 0 {
-            return;
-        }
-        let Some(campaign) = context.campaigns.get(key::key(data, fields[2].0, fields[2].1)) else { return };
-        let Some(ts) = time::parse(&data[fields[3].0..fields[3].1], &mut dates) else { return };
-        if ts < context.base || ts >= context.window_end {
-            return;
-        }
-        // The user's slot in the links is far away in memory: ask for it now and
-        // look the person up CLICK_AHEAD clicks later.
-        links.prefetch(user);
-        let slot = &mut pending[taken % CLICK_AHEAD];
-        if taken >= CLICK_AHEAD {
-            send(links, slot, out);
-        }
-        *slot = (user, Click { person: 0, id, ts: (ts - context.base) as u32, campaign });
-        taken += 1;
-    });
-    for slot in &mut pending[..taken.min(CLICK_AHEAD)] {
-        send(links, slot, out);
-    }
+thread_local! {
+    /// The valid clicks of the chunk being parsed, as `(user, click)`.
+    static PENDING_CLICKS: std::cell::RefCell<Vec<(Key, Click)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Valid clicks waiting for their person to be looked up, as `(user, click)`.
-const CLICK_AHEAD: usize = 16;
-
-#[inline(always)]
-fn send(links: &Links, (user, click): &mut (Key, Click), out: &mut Parts<Click>) {
-    let person = links.person(*user);
-    click.person = person;
-    out.push(partition(person), *click);
+/// Parses a chunk of clicks, then sends them to their people, as for events.
+fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut Parts<Click>) {
+    PENDING_CLICKS.with_borrow_mut(|pending| {
+        pending.clear();
+        let mut dates = time::Dates::new();
+        scan::lines::<4>(data, start, end, |fields| {
+            // Copies of a click are identical and nothing counts clicks, so no dedup is needed:
+            // a second copy can never change which campaign is credited or assists.
+            let id = key::key(data, fields[0].0, fields[0].1);
+            let user = key::key(data, fields[1].0, fields[1].1);
+            if id == 0 || user == 0 {
+                return;
+            }
+            let Some(campaign) = context.campaigns.get(key::key(data, fields[2].0, fields[2].1)) else { return };
+            let Some(ts) = time::parse(&data[fields[3].0..fields[3].1], &mut dates) else { return };
+            if ts < context.base || ts >= context.window_end {
+                return;
+            }
+            pending.push((user, Click { person: 0, id, ts: (ts - context.base) as u32, campaign }));
+        });
+        for (at, &(user, mut click)) in pending.iter().enumerate() {
+            if let Some(&(ahead, _)) = pending.get(at + EVENT_AHEAD) {
+                links.prefetch(ahead);
+            }
+            let person = links.person(user);
+            click.person = person;
+            out.push(partition(person), click);
+        }
+    });
 }
 
 // ------------------------------------------------------------------ 3. dedup
