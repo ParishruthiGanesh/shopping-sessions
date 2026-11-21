@@ -11,6 +11,11 @@
 //!               credit and assist, and write the user_daily rows
 //!   5. campaign_daily from the per-thread totals
 
+// The scanners and the ID packing are written for AVX2. Cargo reads native/.cargo/config.toml
+// only when it runs inside native/: built from elsewhere, the binary would be silently slow.
+#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
+compile_error!("build inside native/ so that .cargo/config.toml applies (it enables AVX2 and BMI2)");
+
 mod bump;
 mod key;
 mod parquet;
@@ -499,9 +504,9 @@ fn join_links(sides: &[Vec<Vec<Side>>], counts: &[usize], shards: Vec<Mutex<Shar
 
 // ------------------------------------------------------------------ 2. parse
 
-fn parse_events(context: &Context, index: &mut scan::Index, data: &[u8], start: usize, end: usize, out: &mut [Part<Event>]) {
+fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &mut [Part<Event>]) {
     let mut dates = time::Dates::new();
-    scan::scan::<7>(index, data, start, end, |fields| {
+    scan::lines::<7>(data, start, end, |fields| {
         // SAFETY: the scan only reports fields inside `data`.
         let field = |at: usize| unsafe { data.get_unchecked(fields[at].0..fields[at].1) };
         let id = key::key(data, fields[0].0, fields[0].1);
@@ -554,11 +559,11 @@ fn parse_events(context: &Context, index: &mut scan::Index, data: &[u8], start: 
     });
 }
 
-fn parse_clicks(context: &Context, links: &Links, index: &mut scan::Index, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
+fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
     let mut dates = time::Dates::new();
     let mut pending: [(Key, Click); CLICK_AHEAD] = std::array::from_fn(|_| (0, Click { person: 0, id: 0, ts: 0, campaign: 0 }));
     let mut taken = 0usize;
-    scan::scan::<4>(index, data, start, end, |fields| {
+    scan::lines::<4>(data, start, end, |fields| {
         // Copies of a click are identical and nothing counts clicks, so no dedup is needed:
         // a second copy can never change which campaign is credited or assists.
         let id = key::key(data, fields[0].0, fields[0].1);
@@ -1125,10 +1130,9 @@ fn main() {
                 scope.spawn(move || {
                     let mut sides: Vec<Vec<Side>> = (0..SHARDS).map(|_| Vec::new()).collect();
                     let mut count = 0u32;
-                    let mut index = scan::Index::default();
                     while let Some(&(file, start, end)) = link_tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
                         let data = files[file].bytes();
-                        scan::scan::<2>(&mut index, data, start, end, |fields| {
+                        scan::lines::<2>(data, start, end, |fields| {
                             let a = key::key(data, fields[0].0, fields[0].1);
                             let b = key::key(data, fields[1].0, fields[1].1);
                             // A self-link changes nothing: an ID alone is its own person anyway.
@@ -1173,9 +1177,8 @@ fn main() {
                         log("links joined");
                     }
                     let (mut events, mut clicks) = (parts(), parts());
-                    let mut index = scan::Index::default();
                     while let Some(&(file, start, end)) = event_tasks.get(next_event.fetch_add(1, Ordering::Relaxed)) {
-                        parse_events(context, &mut index, files[file].bytes(), start, end, &mut events);
+                        parse_events(context, files[file].bytes(), start, end, &mut events);
                     }
                     let links = loop {
                         match links.get() {
@@ -1184,7 +1187,7 @@ fn main() {
                         }
                     };
                     while let Some(&(file, start, end)) = click_tasks.get(next_click.fetch_add(1, Ordering::Relaxed)) {
-                        parse_clicks(context, links, &mut index, files[file].bytes(), start, end, &mut clicks);
+                        parse_clicks(context, links, files[file].bytes(), start, end, &mut clicks);
                     }
                     seal(&mut events);
                     seal(&mut clicks);
