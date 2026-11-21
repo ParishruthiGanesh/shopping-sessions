@@ -210,19 +210,40 @@ impl<T> Block<T> {
     }
 }
 
+/// Bytes of rows a partition gathers before writing them out: three cache lines.
+const STAGE: usize = 192;
+
+#[repr(C, align(64))]
+struct Stage([u8; STAGE]);
+
 /// Rows headed for one partition, in fixed-size blocks so nothing is ever moved.
+///
+/// Rows are gathered in a small staging buffer that stays in the L1 cache and
+/// written to the block three whole cache lines at a time with streaming
+/// stores. Writing rows straight to 256 blocks made every store miss: each
+/// new line had to be read from memory before it could be written.
 struct Part<T> {
+    stage: Stage,
+    staged: usize,
     blocks: Vec<Block<T>>,
     current: *mut T,
+    /// Rows written to the current block.
     len: usize,
 }
 // SAFETY: as for Block.
 unsafe impl<T: Send> Send for Part<T> {}
 
 impl<T> Part<T> {
+    /// Rows per staging buffer. A block holds a whole number of buffers, and
+    /// starts on a page, so every write of the buffer starts on a cache line.
+    const PER_STAGE: usize = {
+        assert!(STAGE % std::mem::size_of::<T>() == 0 && BLOCK_BYTES % STAGE == 0);
+        STAGE / std::mem::size_of::<T>()
+    };
+
     fn new() -> Self {
-        // "Full" until the first push, so that empty partitions cost nothing.
-        Self { blocks: Vec::new(), current: std::ptr::null_mut(), len: Block::<T>::CAPACITY }
+        // "Full" until the first write, so that empty partitions cost nothing.
+        Self { stage: Stage([0; STAGE]), staged: 0, blocks: Vec::new(), current: std::ptr::null_mut(), len: Block::<T>::CAPACITY }
     }
     #[cold]
     #[inline(never)]
@@ -235,19 +256,64 @@ impl<T> Part<T> {
     }
     #[inline(always)]
     fn push(&mut self, value: T) {
+        // SAFETY: `staged` is below PER_STAGE, so the row fits in the buffer.
+        unsafe { self.stage.0.as_mut_ptr().cast::<T>().add(self.staged).write_unaligned(value) };
+        self.staged += 1;
+        if self.staged == Self::PER_STAGE {
+            self.drain();
+        }
+    }
+    /// Writes the full staging buffer to the block.
+    #[inline(never)]
+    fn drain(&mut self) {
         if self.len == Block::<T>::CAPACITY {
             self.grow();
         }
-        // SAFETY: the current block has room for row `len`.
-        unsafe { self.current.add(self.len).write(value) };
-        self.len += 1;
+        // SAFETY: the block has room for PER_STAGE more rows (its capacity is a
+        // multiple of PER_STAGE), and the destination is 64-byte aligned.
+        unsafe {
+            use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
+            let to = self.current.add(self.len).cast::<__m256i>();
+            let from = self.stage.0.as_ptr().cast::<__m256i>();
+            for at in 0..STAGE / 32 {
+                _mm256_stream_si256(to.add(at), _mm256_load_si256(from.add(at)));
+            }
+        }
+        self.len += Self::PER_STAGE;
+        self.staged = 0;
+    }
+    /// Writes out a partly filled staging buffer. Call on the thread that pushed,
+    /// before the rows are read anywhere; `seal` then orders the streaming stores.
+    fn finish(&mut self) {
+        if self.staged == 0 {
+            return;
+        }
+        if self.len == Block::<T>::CAPACITY {
+            self.grow();
+        }
+        // SAFETY: `staged` rows are in the buffer and fit in the block, which has
+        // room for a whole buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.stage.0.as_ptr(), self.current.add(self.len).cast::<u8>(), self.staged * std::mem::size_of::<T>());
+        }
+        self.len += self.staged;
+        self.staged = 0;
     }
     fn into_blocks(mut self) -> Vec<Block<T>> {
+        assert!(self.staged == 0, "a partition was not sealed");
         if !self.current.is_null() {
             self.blocks.push(Block { rows: self.current, len: self.len });
         }
         self.blocks
     }
+}
+
+/// Finishes every partition of this thread and makes its streaming stores
+/// visible to other threads. Call on the thread that pushed.
+fn seal<T>(parts: &mut [Part<T>]) {
+    parts.iter_mut().for_each(Part::finish);
+    // SAFETY: a store fence has no preconditions.
+    unsafe { std::arch::x86_64::_mm_sfence() };
 }
 
 fn parts<T>() -> Vec<Part<T>> {
@@ -291,8 +357,8 @@ struct Visit {
     category: u32,
 }
 
-/// A valid click, by person.
-#[repr(C)]
+/// A valid click, by person. Padded to 48 bytes so that whole rows fill a staging buffer.
+#[repr(C, align(16))]
 struct Click {
     person: [u64; 2],
     id: [u64; 2],
@@ -1064,6 +1130,8 @@ fn main() {
                     while let Some(&(file, start, end)) = click_tasks.get(next_click.fetch_add(1, Ordering::Relaxed)) {
                         parse_clicks(context, links, &mut index, files[file].bytes(), start, end, &mut clicks);
                     }
+                    seal(&mut events);
+                    seal(&mut clicks);
                     (events, clicks)
                 })
             })
@@ -1090,6 +1158,7 @@ fn main() {
                         // The survivors of later partitions go into these blocks.
                         blocks.into_iter().for_each(Block::recycle);
                     }
+                    seal(&mut out);
                     out
                 })
             })
