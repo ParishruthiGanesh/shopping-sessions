@@ -1,5 +1,5 @@
 # Team
 
-Name:
+Name: Team Inventors
 Members:
-Engine: DuckDB
+Engine: native Rust pipeline (no dependencies); DuckDB reference pipeline for cross-checking

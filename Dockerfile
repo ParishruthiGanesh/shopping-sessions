@@ -1,4 +1,4 @@
-# Shopping Sessions, Team Inventors: a native (Rust) pipeline.
+# Shopping Sessions, Team Inventors: a native (Rust) pipeline with no dependencies.
 # The scorers are linux/amd64 Intel Xeon, Cascade Lake or newer. They build this
 # file natively, so no FROM line pins a platform. Base images are pinned by digest.
 FROM rust:1.97-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS build

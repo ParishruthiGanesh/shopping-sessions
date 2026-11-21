@@ -35,7 +35,7 @@ const PARTITION_BITS: u32 = 8;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
 const BLOCK_BITS: u32 = 12;
 const BLOCK: usize = 1 << BLOCK_BITS;
-const CHUNK: usize = 1 << 20;
+const CHUNK: usize = 1 << 18;
 const INVALID: u32 = u32::MAX;
 const SESSION_GAP: u32 = 30 * 60 * 1000;
 const WEEK: u32 = 7 * DAY as u32;
@@ -124,7 +124,7 @@ fn read_lookup(path: &Path) -> Vec<(Key, Vec<u8>)> {
     if let Some(mapped) = Mapped::open(path) {
         let data = mapped.bytes();
         for (start, end) in scan::chunks(data, usize::MAX) {
-            scan::scan::<2>(data, start, end, |fields| {
+            scan::scan::<2>(&mut scan::Index::default(), data, start, end, |fields| {
                 rows.push((key::key(data, fields[0].0, fields[0].1), data[fields[1].0..fields[1].1].to_vec()));
             });
         }
@@ -442,15 +442,17 @@ fn join_links(sides: &[Vec<Vec<Side>>], counts: &[usize], shards: Vec<Mutex<Shar
 
 // ------------------------------------------------------------------ 2. parse
 
-fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &mut [Part<Event>]) {
+fn parse_events(context: &Context, index: &mut scan::Index, data: &[u8], start: usize, end: usize, out: &mut [Part<Event>]) {
     let mut dates = time::Dates::new();
-    scan::scan::<7>(data, start, end, |fields| {
+    scan::scan::<7>(index, data, start, end, |fields| {
+        // SAFETY: the scan only reports fields inside `data`.
+        let field = |at: usize| unsafe { data.get_unchecked(fields[at].0..fields[at].1) };
         let id = key::key(data, fields[0].0, fields[0].1);
         if id == 0 {
             return;
         }
         let user = key::key(data, fields[1].0, fields[1].1);
-        let ingest = time::parse(&data[fields[3].0..fields[3].1], &mut dates);
+        let ingest = time::parse(field(3), &mut dates);
         let mut event = Event {
             id: split(id),
             user: split(user),
@@ -463,7 +465,7 @@ fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &
             if user == 0 || fields[5].0 == fields[5].1 {
                 break 'valid;
             }
-            let Some(ts) = time::parse(&data[fields[2].0..fields[2].1], &mut dates) else { break 'valid };
+            let Some(ts) = time::parse(field(2), &mut dates) else { break 'valid };
             if ts < context.window_start || ts >= context.window_end {
                 break 'valid;
             }
@@ -471,28 +473,33 @@ fn parse_events(context: &Context, data: &[u8], start: usize, end: usize, out: &
             if ingest - ts > DAY {
                 break 'valid;
             }
-            match &data[fields[4].0..fields[4].1] {
-                b"view" | b"cart" => {}
-                b"purchase" => {
-                    let Some(price) = time::digits(&data[fields[6].0..fields[6].1], 8) else { break 'valid };
-                    if !(1..=10_000_000).contains(&price) {
-                        break 'valid;
-                    }
-                    event.price = price as u32;
-                    let product = key::key(data, fields[5].0, fields[5].1);
-                    event.category = context.products.get(product).unwrap_or(context.unknown_category);
+            let kind = field(4);
+            if kind.len() == 4 {
+                let kind = u32::from_le_bytes(kind.try_into().unwrap());
+                if kind != u32::from_le_bytes(*b"view") && kind != u32::from_le_bytes(*b"cart") {
+                    break 'valid;
                 }
-                _ => break 'valid,
+            } else if kind == b"purchase" {
+                let Some(price) = time::digits(field(6), 8) else { break 'valid };
+                if !(1..=10_000_000).contains(&price) {
+                    break 'valid;
+                }
+                event.price = price as u32;
+                let product = key::key(data, fields[5].0, fields[5].1);
+                event.category = context.products.get(product).unwrap_or(context.unknown_category);
+            } else {
+                break 'valid;
             }
             event.ts = (ts - context.base) as u32;
         }
-        out[partition(id)].push(event);
+        // SAFETY: a partition number is below PARTITIONS, the length of `out`.
+        unsafe { out.get_unchecked_mut(partition(id)) }.push(event);
     });
 }
 
-fn parse_clicks(context: &Context, links: &Links, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
+fn parse_clicks(context: &Context, links: &Links, index: &mut scan::Index, data: &[u8], start: usize, end: usize, out: &mut [Part<Click>]) {
     let mut dates = time::Dates::new();
-    scan::scan::<4>(data, start, end, |fields| {
+    scan::scan::<4>(index, data, start, end, |fields| {
         // Copies of a click are identical and nothing counts clicks, so no dedup is needed:
         // a second copy can never change which campaign is credited or assists.
         let id = key::key(data, fields[0].0, fields[0].1);
@@ -996,9 +1003,10 @@ fn main() {
                 scope.spawn(move || {
                     let mut sides: Vec<Vec<Side>> = (0..SHARDS).map(|_| Vec::new()).collect();
                     let mut count = 0u32;
+                    let mut index = scan::Index::default();
                     while let Some(&(file, start, end)) = link_tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
                         let data = files[file].bytes();
-                        scan::scan::<2>(data, start, end, |fields| {
+                        scan::scan::<2>(&mut index, data, start, end, |fields| {
                             let a = key::key(data, fields[0].0, fields[0].1);
                             let b = key::key(data, fields[1].0, fields[1].1);
                             // A self-link changes nothing: an ID alone is its own person anyway.
@@ -1043,8 +1051,9 @@ fn main() {
                         log("links joined");
                     }
                     let (mut events, mut clicks) = (parts(), parts());
+                    let mut index = scan::Index::default();
                     while let Some(&(file, start, end)) = event_tasks.get(next_event.fetch_add(1, Ordering::Relaxed)) {
-                        parse_events(context, files[file].bytes(), start, end, &mut events);
+                        parse_events(context, &mut index, files[file].bytes(), start, end, &mut events);
                     }
                     let links = loop {
                         match links.get() {
@@ -1053,7 +1062,7 @@ fn main() {
                         }
                     };
                     while let Some(&(file, start, end)) = click_tasks.get(next_click.fetch_add(1, Ordering::Relaxed)) {
-                        parse_clicks(context, links, files[file].bytes(), start, end, &mut clicks);
+                        parse_clicks(context, links, &mut index, files[file].bytes(), start, end, &mut clicks);
                     }
                     (events, clicks)
                 })
@@ -1179,6 +1188,11 @@ fn main() {
     });
     written.unwrap_or_else(|error| fail(&format!("campaign_daily: {error}")));
     log("campaign_daily written");
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        if let Some(peak) = status.lines().find(|line| line.starts_with("VmHWM")) {
+            eprintln!("peak memory: {}", peak.trim_start_matches("VmHWM:").trim());
+        }
+    }
     // Leave without unmapping or freeing anything: the kernel does it faster.
     std::process::exit(0);
 }

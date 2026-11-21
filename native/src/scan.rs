@@ -31,81 +31,140 @@ unsafe fn masks(block: *const u8) -> (u32, u32, u32) {
     (separator, newline, quote)
 }
 
-/// Calls `line` with the unquoted `(start, end)` of each field for every
-/// well-formed line of `N` fields (at most 16) in `data[start..end]`. `start` is
-/// the start of a line and `end` is just after a newline or the end of the file.
-///
-/// Only separators are visited one by one. Quotes are counted per line: a line
-/// is well formed exactly when it has two quotes for each field that both starts
-/// and ends with one, and no others.
+/// The scan's working memory, kept by each thread between chunks.
+#[derive(Default)]
+pub struct Index {
+    /// Where each separator is, as an offset from the start of the chunk.
+    separators: Vec<u32>,
+    /// Where each newline is: a subset of `separators`.
+    newlines: Vec<u32>,
+    /// Per 32-byte step: its quote mask, and how many quotes come before it.
+    quotes: Vec<(u32, u32)>,
+}
+
+/// Appends the offset of every set bit of `mask` (plus `base`) at `out`, and
+/// returns the pointer after them. Writes up to 8 slots more than it keeps.
 #[inline(always)]
-pub fn scan<const N: usize>(data: &[u8], start: usize, end: usize, mut line: impl FnMut(&[(usize, usize); N])) {
-    let mut separators = [0usize; 16]; // where each field of the current line ends
-    let mut count = 0usize;
-    let mut line_start = start;
-    let mut quotes = 0u32;
-
-    macro_rules! finish {
-        () => {
-            if count == N {
-                let mut fields = [(0usize, 0usize); N];
-                let mut from = line_start;
-                for at in 0..N {
-                    fields[at] = (from, separators[at]);
-                    from = separators[at] + 1;
-                }
-                let mut good = true;
-                if quotes != 0 {
-                    let mut wrapped = 0;
-                    for field in fields.iter_mut() {
-                        if field.1 - field.0 >= 2 && data[field.0] == b'"' && data[field.1 - 1] == b'"' {
-                            *field = (field.0 + 1, field.1 - 1);
-                            wrapped += 1;
-                        }
-                    }
-                    good = quotes == 2 * wrapped;
-                }
-                if good {
-                    line(&fields);
-                }
-            }
-        };
-    }
-
-    let mut block = start;
-    while block < end {
-        let (mut separator, newline, mut quote) = if block + STEP <= end {
-            // SAFETY: the bytes are inside `data`.
-            unsafe { masks(data.as_ptr().add(block)) }
-        } else {
-            let mut tail = [0u8; STEP];
-            tail[..end - block].copy_from_slice(&data[block..end]);
-            // SAFETY: `tail` is a whole step.
-            unsafe { masks(tail.as_ptr()) }
-        };
-        while separator != 0 {
-            let bit = separator.trailing_zeros();
-            separators[count & 15] = block + bit as usize;
-            count += 1;
-            if newline >> bit & 1 != 0 {
-                let before = (1u32 << bit) - 1;
-                quotes += (quote & before).count_ones();
-                quote &= !before;
-                finish!();
-                line_start = block + bit as usize + 1;
-                count = 0;
-                quotes = 0;
-            }
-            separator &= separator - 1;
+unsafe fn flatten(mut mask: u32, base: u32, mut out: *mut u32) -> *mut u32 {
+    let count = mask.count_ones() as usize;
+    let end = out.add(count);
+    // Four at a time without looking at the count: mispredicting a loop exit
+    // costs more than writing a few slots that the next call overwrites.
+    loop {
+        for slot in 0..4 {
+            *out.add(slot) = base + mask.trailing_zeros();
+            mask &= mask.wrapping_sub(1);
         }
-        quotes += quote.count_ones();
-        block += STEP;
+        out = out.add(4);
+        if mask == 0 {
+            return end;
+        }
     }
-    if line_start < end {
-        // The file's last line has no newline.
-        separators[count & 15] = end;
-        count += 1;
-        finish!();
+}
+
+/// Calls `line` with the unquoted `(start, end)` of each field for every
+/// well-formed line of `N` fields (at most 16) in `data[start..end]`. `start` is the start
+/// of a line and `end` is just after a newline or the end of the file; the
+/// chunk must be shorter than 4 GB.
+///
+/// Stage one finds every separator, newline and quote with vector compares.
+/// Stage two walks the lines: a line has `N` fields exactly when its newline is
+/// the `N`th separator after the previous newline, and it is well formed exactly
+/// when it has two quotes for each field that both starts and ends with one,
+/// and no others.
+#[inline(always)]
+pub fn scan<const N: usize>(index: &mut Index, data: &[u8], start: usize, end: usize, mut line: impl FnMut(&[(usize, usize); N])) {
+    let len = end - start;
+    if len == 0 {
+        return;
+    }
+    assert!(len < u32::MAX as usize - 64 && end <= data.len());
+    let steps = len.div_ceil(STEP);
+    // Worst case every byte is a separator; the slack is for `flatten` and the closing newline.
+    index.separators.clear();
+    index.separators.reserve(len + 32);
+    index.newlines.clear();
+    index.newlines.reserve(len + 32);
+    index.quotes.clear();
+    index.quotes.reserve(steps + 1);
+    // SAFETY: the reserved capacities cover everything written below: at most one
+    // slot per input byte plus the slack, and one quote entry per step.
+    unsafe {
+        let chunk = data.as_ptr().add(start);
+        let separators = index.separators.as_mut_ptr();
+        let newlines = index.newlines.as_mut_ptr();
+        let quotes = index.quotes.as_mut_ptr();
+        let (mut separator_at, mut newline_at) = (separators, newlines);
+        let mut quotes_before = 0u32;
+        for step in 0..steps {
+            let offset = step * STEP;
+            let (separator, newline, quote) = if offset + STEP <= len {
+                masks(chunk.add(offset))
+            } else {
+                let mut tail = [0u8; STEP];
+                tail[..len - offset].copy_from_slice(&data[start + offset..end]);
+                masks(tail.as_ptr())
+            };
+            separator_at = flatten(separator, offset as u32, separator_at);
+            newline_at = flatten(newline, offset as u32, newline_at);
+            *quotes.add(step) = (quote, quotes_before);
+            quotes_before += quote.count_ones();
+        }
+        if *chunk.add(len - 1) != b'\n' {
+            // The file's last line has no newline: close it as if it had one.
+            *separator_at = len as u32;
+            *newline_at = len as u32;
+            (separator_at, newline_at) = (separator_at.add(1), newline_at.add(1));
+        }
+        // Stage two looks up to N separators ahead: past the last one it must find
+        // nothing that could pass for a newline.
+        for slot in 0..16 {
+            *separator_at.add(slot) = u32::MAX;
+        }
+        *quotes.add(steps) = (0, quotes_before);
+        let lines = newline_at.offset_from(newlines) as usize;
+        let quotes_until = |offset: usize| {
+            let (mask, before) = *quotes.add(offset / STEP);
+            before + (mask & ((1u32 << (offset % STEP)) - 1)).count_ones()
+        };
+
+        let mut separator_at = separators;
+        let mut line_start = 0usize;
+        for line_at in 0..lines {
+            let newline = *newlines.add(line_at);
+            if *separator_at.add(N - 1) != newline {
+                // Too few or too many fields: skip to the separator that is this newline.
+                while *separator_at != newline {
+                    separator_at = separator_at.add(1);
+                }
+                separator_at = separator_at.add(1);
+                line_start = newline as usize + 1;
+                continue;
+            }
+            let mut fields = [(0usize, 0usize); N];
+            let mut from = line_start;
+            for (at, field) in fields.iter_mut().enumerate() {
+                let to = *separator_at.add(at) as usize;
+                *field = (start + from, start + to);
+                from = to + 1;
+            }
+            separator_at = separator_at.add(N);
+            let line_quotes = quotes_until(newline as usize) - quotes_until(line_start);
+            line_start = newline as usize + 1;
+            if line_quotes != 0 {
+                let mut wrapped = 0;
+                for field in fields.iter_mut() {
+                    // A field of two or more bytes that starts and ends with a quote loses both.
+                    let both = field.1 - field.0 >= 2 && *data.get_unchecked(field.0) == b'"' && *data.get_unchecked(field.1 - 1) == b'"';
+                    *field = (field.0 + usize::from(both), field.1 - usize::from(both));
+                    wrapped += u32::from(both);
+                }
+                if line_quotes != 2 * wrapped {
+                    continue;
+                }
+            }
+            line(&fields);
+        }
     }
 }
 

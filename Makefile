@@ -8,7 +8,7 @@ DEV   ?= dev
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev
+.PHONY: build fixtures dev run-dev check-dev native fixtures-native fixtures-duckdb
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
@@ -30,3 +30,13 @@ run-dev: build
 ANSWER ?= dev-answer
 check-dev:
 	python3 scripts/compare.py out $(ANSWER)
+
+## Build the native binary without Docker (needs Rust 1.89 or newer)
+native:
+	cd native && cargo build --release --locked
+
+## The 36 fixtures against the native binary and against the DuckDB reference, without Docker
+fixtures-native: native
+	python3 scripts/run_fixtures.py $(FIXTURES) -- native/target/release/shopping-sessions
+fixtures-duckdb:
+	python3 scripts/run_fixtures.py $(FIXTURES) -- python3 pipeline/pipeline.py

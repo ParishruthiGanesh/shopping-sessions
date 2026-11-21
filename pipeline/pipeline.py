@@ -65,13 +65,16 @@ def parsed(folder_or_file, n):
 
 
 # ----------------------------------------------------------------- timestamps
-# F1 / F2 calendar checks are left to DuckDB's strict TIMESTAMP cast; the offset
-# range is checked here. F3 is digits only; more than 15 significant digits is
+# F1 / F2 dates are checked by DuckDB's TIMESTAMP cast; the time-of-day and offset
+# ranges are checked here. F3 is digits only; more than 15 significant digits is
 # far outside any window, so it is null like any other bad timestamp.
 D2 = "[0-9]{2}"
 CIVIL = f"[0-9]{{4}}-{D2}-{D2}T{D2}:{D2}:{D2}"
 con.execute(f"""
-CREATE MACRO civil_ms(s) AS epoch_ms(TRY_CAST(replace(substr(s, 1, 19), 'T', ' ') AS TIMESTAMP));
+CREATE MACRO civil_ms(s) AS CASE
+    -- DuckDB's cast accepts hour 24 as the next midnight; the rules do not.
+    WHEN substr(s, 12, 2) <= '23' AND substr(s, 15, 2) <= '59' AND substr(s, 18, 2) <= '59'
+        THEN epoch_ms(TRY_CAST(replace(substr(s, 1, 19), 'T', ' ') AS TIMESTAMP)) END;
 CREATE MACRO parse_ts(s) AS CASE
     WHEN regexp_full_match(s, '{CIVIL}Z') THEN civil_ms(s)
     WHEN regexp_full_match(s, '{CIVIL}[+-]{D2}:{D2}')
